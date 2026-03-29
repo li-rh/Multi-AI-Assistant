@@ -46,7 +46,7 @@
  * 2. 图片同步（粘贴）：来自“多模型同时回答 & 目录导航.js”（继承能力）。
  * 3. 网络拦截提问 + 本地事件兜底：分别来自两份原脚本，当前版本做了融合（继承能力）。
  * 4. 选择状态同步、常用模型可见性、动画样式切换：来自“AI 对话助手(一键同步多模型).js”（继承能力）。
- * 5. 本版扩展一：在“图片同步”基础上扩展为“图片 + 通用文件同步”（新增 drop / file input 监听）。
+ * 5. 本版扩展一：在“图片同步”基础上扩展为“图片 + 通用文件同步”（当前排障阶段收敛为 paste-only）。
  * 6. 本版扩展二：新增独立资产通道与状态隔离（SHARED_ASSET、资产过期控制、远端注入流程）。
  *
  * 【v3.1 更新日志】
@@ -61,8 +61,8 @@
  *
  * 【v3.2-dev 调试增强】
  * 1. 新增“资产链路调试日志”独立开关（菜单可切换，默认关闭）。
- * 2. 覆盖 paste/drop/file-input/change/去重命中/广播/接收/注入关键链路打点，便于定位少数站点异常双触发。
- * 3. 新增“站点上传规则列表”机制：支持按站点配置是否允许 file input 回退（当前对 TONGYI 默认禁用回退）。
+ * 2. 覆盖 paste/去重命中/广播/接收/注入关键链路打点，便于定位少数站点异常双触发。
+ * 3. 资产注入策略当前统一为 paste 通道，去除 drop/file input 回退链路。
  *
  * 【v3.3-dev 注入策略重构（方案B）】
  * 1. 资产注入改为“两阶段”：先执行注入动作，再做短窗口结果校验；仅在未通过校验时触发回退。
@@ -95,11 +95,16 @@
             suppressNextLocalSendCaptureUntil: 0,
             recentAssetFingerprints: new Map(),
             processedAssetMessageIds: new Map(),
+            lastOutboundAssetSignalAt: 0,
+            lastOutboundAssetSignalMeta: null,
             menuCommandId: null,
             assetTraceMenuCommandId: null,
             tooltipTimeoutId: null,
             animationStyle: 'spin',
             isSelectionSynced: true,
+            assetChannelToggles: {
+                paste: true,
+            },
             isStrictModeEnabled: false,
             strictModeMenuCommandId: null,
         },
@@ -118,6 +123,7 @@
                 ANIMATION_STYLE: 'multi_sync_animation_style_v1.0',
                 SELECTION_SYNC_ENABLED: 'multi_sync_selection_sync_v1.0',
                 SHARED_SELECTION: 'multi_sync_shared_selection_v1.0',
+                ASSET_CHANNEL_SWITCHES: 'multi_sync_asset_channel_switches_v1.0',
                 STRICT_MODE_ENABLED: 'multi_sync_strict_mode_v1.0',
             },
             TIMINGS: {
@@ -132,21 +138,8 @@
                 REMOTE_ASSET_SUPPRESS_WINDOW: 2500,
                 ASSET_PROCESSED_ID_TTL: 60000,
                 PASTE_VERIFY_DELAY: 500,
-                FILE_INPUT_VERIFY_DELAY: 500,
-                FILE_INPUT_DISCOVERY_TIMEOUT: 1500,
+                ASSET_NETWORK_VERIFY_WINDOW: 2800,
                 TOOLTIP_DELAY: 300,
-            },
-            ASSET_UPLOAD_RULES: {
-                DEFAULT: {
-                    enablePasteForImage: true,
-                    enableFileInputFallbackForImage: true,
-                    enableFileInputForNonImage: true,
-                },
-                TONGYI: {
-                    enablePasteForImage: true,
-                    enableFileInputFallbackForImage: false,
-                    enableFileInputForNonImage: true,
-                },
             },
             DISPLAY_ORDER: ['AI_STUDIO', 'GEMINI', 'TONGYI', 'QWEN', 'YUANBAO', 'CHATGPT', 'CLAUDE', 'DOUBAO', 'DEEPSEEK', 'KIMI', 'GROK'],
             SITES: {
@@ -431,6 +424,71 @@
                     : '';
                 return `${tag}${id}${classes ? `.${classes}` : ''}`;
             },
+            getHeaderValue(headers, name) {
+                if (!headers || !name) return '';
+                const lowerName = String(name).toLowerCase();
+                try {
+                    if (typeof Headers !== 'undefined' && headers instanceof Headers) {
+                        return headers.get(name) || headers.get(lowerName) || '';
+                    }
+                } catch (e) { }
+                if (Array.isArray(headers)) {
+                    const entry = headers.find(([key]) => String(key).toLowerCase() === lowerName);
+                    return entry?.[1] || '';
+                }
+                if (typeof headers === 'object') {
+                    const key = Object.keys(headers).find((k) => String(k).toLowerCase() === lowerName);
+                    return key ? headers[key] : '';
+                }
+                return '';
+            },
+            isLikelyAssetPayload(body, contentType = '') {
+                const bodyType = this.getBodyType(body);
+                const ct = String(contentType || '').toLowerCase();
+                if (ct.includes('multipart/form-data') || ct.includes('application/octet-stream')) return true;
+                if (typeof FormData !== 'undefined' && body instanceof FormData) {
+                    try {
+                        for (const value of body.values()) {
+                            if ((typeof File !== 'undefined' && value instanceof File)
+                                || (typeof Blob !== 'undefined' && value instanceof Blob)) {
+                                return true;
+                            }
+                        }
+                    } catch (e) {
+                        return true;
+                    }
+                }
+                if (typeof Blob !== 'undefined' && body instanceof Blob) return true;
+                if (body instanceof ArrayBuffer || ArrayBuffer.isView(body)) return true;
+                if (typeof body === 'string') {
+                    return body.includes('filename=') || body.includes('data:image/') || body.includes('data:application/');
+                }
+                if (bodyType === 'Request') return ct.includes('multipart/form-data');
+                return false;
+            },
+            markOutboundAssetSignal(meta = {}) {
+                AITabSync.state.lastOutboundAssetSignalAt = Date.now();
+                AITabSync.state.lastOutboundAssetSignalMeta = meta;
+                this.assetTrace('捕获到上传网络信号', {
+                    at: AITabSync.state.lastOutboundAssetSignalAt,
+                    ...meta,
+                });
+            },
+            hasRecentOutboundAssetSignal(sinceTs = 0, maxAge = 5000) {
+                const signalAt = AITabSync.state.lastOutboundAssetSignalAt || 0;
+                if (!signalAt) return false;
+                if (signalAt < sinceTs) return false;
+                return Date.now() - signalAt <= maxAge;
+            },
+            async waitForOutboundAssetSignal(sinceTs = 0, timeout = 2800) {
+                if (this.hasRecentOutboundAssetSignal(sinceTs, timeout + 300)) return true;
+                const startedAt = Date.now();
+                while (Date.now() - startedAt < timeout) {
+                    await new Promise((resolve) => setTimeout(resolve, 120));
+                    if (this.hasRecentOutboundAssetSignal(sinceTs, timeout + 300)) return true;
+                }
+                return false;
+            },
             waitFor(conditionFn, timeout, description) {
                 return new Promise((resolve, reject) => {
                     let result = conditionFn();
@@ -652,104 +710,6 @@
                     if (now - ts > ttl) map.delete(key);
                 }
             },
-            getAssetUploadRule(siteId) {
-                const allRules = AITabSync.config.ASSET_UPLOAD_RULES || {};
-                const defaultRule = allRules.DEFAULT || {};
-                const siteRule = (siteId && allRules[siteId]) || {};
-                return {
-                    enablePasteForImage: siteRule.enablePasteForImage
-                        ?? siteRule.enablePaste
-                        ?? defaultRule.enablePasteForImage
-                        ?? defaultRule.enablePaste
-                        ?? true,
-                    enableFileInputFallbackForImage: siteRule.enableFileInputFallbackForImage
-                        ?? siteRule.enableFileInputFallback
-                        ?? defaultRule.enableFileInputFallbackForImage
-                        ?? defaultRule.enableFileInputFallback
-                        ?? true,
-                    enableFileInputForNonImage: siteRule.enableFileInputForNonImage
-                        ?? siteRule.enableFileInputFallbackForNonImage
-                        ?? defaultRule.enableFileInputForNonImage
-                        ?? defaultRule.enableFileInputFallbackForNonImage
-                        ?? true,
-                };
-            },
-            isFileAcceptedByInput(input, file) {
-                if (!input || !file) return true;
-                const accept = String(input.accept || '').trim().toLowerCase();
-                if (!accept) return true;
-                const mimeType = String(file.type || '').toLowerCase();
-                const fileName = String(file.name || '').toLowerCase();
-                return accept
-                    .split(',')
-                    .map((token) => token.trim())
-                    .filter(Boolean)
-                    .some((token) => {
-                        if (token === '*/*') return true;
-                        if (token.endsWith('/*')) {
-                            return mimeType.startsWith(token.slice(0, -1));
-                        }
-                        if (token.startsWith('.')) {
-                            return fileName.endsWith(token);
-                        }
-                        return mimeType === token;
-                    });
-            },
-            findBestFileInput(file = null) {
-                const all = this.deepQuerySelectorAll('input[type="file"]')
-                    .filter((el) => !el.disabled && !el.readOnly);
-                const accepted = file ? all.filter((el) => this.isFileAcceptedByInput(el, file)) : all;
-                const candidates = accepted.length > 0 ? accepted : all;
-                if (candidates.length === 0) {
-                    return this.deepQuerySelector('input[type="file"]:not([disabled])');
-                }
-                const visible = candidates.filter((el) => this.isElementVisible(el));
-                return visible.find((el) => el === document.activeElement)
-                    || visible[0]
-                    || candidates.find((el) => el === document.activeElement)
-                    || candidates[0];
-            },
-            findUploadTrigger() {
-                const selectors = [
-                    'button[aria-label*="上传"]',
-                    'button[aria-label*="Upload"]',
-                    'button[aria-label*="附件"]',
-                    'button[aria-label*="Attach"]',
-                    '[role="button"][aria-label*="上传"]',
-                    '[role="button"][aria-label*="Upload"]',
-                    '[role="button"][aria-label*="附件"]',
-                    '[role="button"][aria-label*="Attach"]',
-                    'button[data-testid*="upload"]',
-                    'button[data-testid*="attach"]',
-                    'label[for][aria-label*="上传"]',
-                    'label[for][aria-label*="Upload"]',
-                ];
-
-                const collected = selectors.flatMap((selector) => this.deepQuerySelectorAll(selector));
-                const unique = [...new Set(collected)].filter((el) => !el.disabled && this.isElementVisible(el));
-                return unique.find((el) => el === document.activeElement) || unique[0] || null;
-            },
-            async discoverFileInputViaTrigger(file, timeout) {
-                const existing = this.findBestFileInput(file);
-                if (existing) return existing;
-
-                const trigger = this.findUploadTrigger();
-                if (!trigger) return null;
-
-                try {
-                    trigger.click();
-                } catch (e) { }
-
-                try {
-                    return await this.waitFor(
-                        () => this.findBestFileInput(file),
-                        timeout,
-                        'file input after upload trigger'
-                    );
-                } catch (e) {
-                    return null;
-                }
-            },
             takeAssetDomSnapshot(anchor = null) {
                 const root = anchor?.closest('form,[role="form"],main,section') || document;
                 const attachmentSelectors = [
@@ -787,37 +747,6 @@
                     cancelable: true
                 });
                 target.dispatchEvent(pasteEvent);
-            },
-            dispatchDropWithFile(target, file) {
-                const dt = new DataTransfer();
-                dt.items.add(file);
-                let dropEvent = null;
-                try {
-                    dropEvent = new DragEvent('drop', {
-                        dataTransfer: dt,
-                        bubbles: true,
-                        cancelable: true,
-                    });
-                } catch (error) {
-                    dropEvent = new Event('drop', { bubbles: true, cancelable: true });
-                    Object.defineProperty(dropEvent, 'dataTransfer', {
-                        value: dt,
-                        configurable: true,
-                    });
-                }
-                target.dispatchEvent(dropEvent);
-            },
-            dispatchFileInputChange(input, file) {
-                try {
-                    const dt = new DataTransfer();
-                    dt.items.add(file);
-                    input.files = dt.files;
-                    input.dispatchEvent(new Event('input', { bubbles: true, cancelable: true }));
-                    input.dispatchEvent(new Event('change', { bubbles: true, cancelable: true }));
-                    return true;
-                } catch (e) {
-                    return false;
-                }
             },
         },
 
@@ -1472,6 +1401,36 @@
                 toggleContainerSync.appendChild(switchLabelSync);
                 uiGroupSync.appendChild(toggleContainerSync);
                 panel.appendChild(uiGroupSync);
+
+                const createAssetChannelToggle = (labelText, channelKey, checked) => {
+                    const group = document.createElement('div');
+                    group.className = 'ai-sync-settings-uigroup';
+                    const container = document.createElement('div');
+                    container.className = 'ai-sync-settings-toggle';
+                    const label = document.createElement('span');
+                    label.textContent = labelText;
+                    container.appendChild(label);
+                    const switchLabel = document.createElement('label');
+                    switchLabel.className = 'toggle-switch';
+                    const switchInput = document.createElement('input');
+                    switchInput.type = 'checkbox';
+                    switchInput.className = 'ai-sync-asset-channel-toggle';
+                    switchInput.dataset.channel = channelKey;
+                    switchInput.checked = !!checked;
+                    const switchTrack = document.createElement('div');
+                    switchTrack.className = 'toggle-switch-track';
+                    const switchThumb = document.createElement('div');
+                    switchThumb.className = 'toggle-switch-thumb';
+                    switchTrack.appendChild(switchThumb);
+                    switchLabel.appendChild(switchInput);
+                    switchLabel.appendChild(switchTrack);
+                    container.appendChild(switchLabel);
+                    group.appendChild(container);
+                    return group;
+                };
+
+                panel.appendChild(createAssetChannelToggle('资产通道：Paste', 'paste', state.assetChannelToggles?.paste !== false));
+
                 overlay.appendChild(panel);
                 document.body.appendChild(overlay);
                 AITabSync.elements.settingsModal = overlay;
@@ -1580,6 +1539,7 @@
             async onSettingsChange(event) { return EventsModule.onSettingsChange(event); },
             async onAnimationToggleChange(event) { return EventsModule.onAnimationToggleChange(event); },
             async onSelectionSyncToggleChange(event) { return EventsModule.onSelectionSyncToggleChange(event); },
+            async onAssetChannelToggleChange(event) { return EventsModule.onAssetChannelToggleChange(event); },
             onClickOutside(event) { return EventsModule.onClickOutside(event); },
             onChipMouseOver(event) { return EventsModule.onChipMouseOver(event); },
             onChipMouseOut(event) { return EventsModule.onChipMouseOut(event); },
@@ -1847,6 +1807,18 @@
             }
             state.animationStyle = await infra.storage.get(config.KEYS.ANIMATION_STYLE, 'spin');
             state.isSelectionSynced = await infra.storage.get(config.KEYS.SELECTION_SYNC_ENABLED, true);
+            const savedAssetChannelToggles = await infra.storage.get(config.KEYS.ASSET_CHANNEL_SWITCHES, null);
+            const defaultAssetChannelToggles = {
+                paste: true,
+            };
+            if (savedAssetChannelToggles && typeof savedAssetChannelToggles === 'object') {
+                state.assetChannelToggles = {
+                    paste: savedAssetChannelToggles.paste !== false,
+                };
+            } else {
+                state.assetChannelToggles = defaultAssetChannelToggles;
+                await infra.storage.set(config.KEYS.ASSET_CHANNEL_SWITCHES, state.assetChannelToggles);
+            }
             state.isStrictModeEnabled = await infra.storage.get(config.KEYS.STRICT_MODE_ENABLED, false);
             if (state.isSelectionSynced) {
                 const sharedSelection = await infra.storage.get(config.KEYS.SHARED_SELECTION, '[]');
@@ -1882,6 +1854,13 @@
                     state.selectedTargets = new Set(JSON.parse(nv || '[]'));
                     ui.updatePanelState();
                     ui.updateSelectAllButtonState();
+                }
+            });
+            infra.storage.listen(config.KEYS.ASSET_CHANNEL_SWITCHES, (name, ov, nv) => {
+                if (nv && typeof nv === 'object') {
+                    state.assetChannelToggles = {
+                        paste: nv.paste !== false,
+                    };
                 }
             });
             infra.storage.listen(config.KEYS.STRICT_MODE_ENABLED, (name, ov, nv) => {
@@ -1971,6 +1950,9 @@
             elements.settingsModal.querySelector('.ai-sync-settings-list').addEventListener('change', onSettingsChange);
             elements.settingsModal.querySelector('#ai-sync-animation-toggle').addEventListener('change', onAnimationToggleChange);
             elements.settingsModal.querySelector('#ai-sync-selection-sync-toggle').addEventListener('change', onSelectionSyncToggleChange);
+            elements.settingsModal.querySelectorAll('.ai-sync-asset-channel-toggle').forEach((toggleEl) => {
+                toggleEl.addEventListener('change', onAssetChannelToggleChange);
+            });
             elements.container.addEventListener('mouseover', onChipMouseOver, true);
             elements.container.addEventListener('mouseout', onChipMouseOut, true);
         };
@@ -2074,6 +2056,20 @@
             }
         };
 
+        const onAssetChannelToggleChange = async (event) => {
+            const { state, config, utils } = AITabSync;
+            const target = event.target;
+            const channel = target?.dataset?.channel;
+            if (!channel) return;
+            const nextToggles = {
+                paste: state.assetChannelToggles?.paste !== false,
+                [channel]: !!target.checked,
+            };
+            state.assetChannelToggles = nextToggles;
+            await infra.storage.set(config.KEYS.ASSET_CHANNEL_SWITCHES, nextToggles);
+            utils.log('资产通道开关已更新', nextToggles);
+        };
+
         const onClickOutside = (event) => {
             const { container } = AITabSync.elements;
             if (container && !container.contains(event.target) && container.classList.contains('expanded')) {
@@ -2133,6 +2129,7 @@
             onSettingsChange,
             onAnimationToggleChange,
             onSelectionSyncToggleChange,
+            onAssetChannelToggleChange,
             onClickOutside,
             onChipMouseOver,
             onChipMouseOut,
@@ -2150,11 +2147,22 @@
             if (!send._isHooked) {
                 const { open } = unsafeWindow.XMLHttpRequest.prototype;
                 unsafeWindow.XMLHttpRequest.prototype.open = function (method, url, ...args) {
+                    this._method = String(method || 'GET').toUpperCase();
                     this._url = url;
                     return open.apply(this, [method, url, ...args]);
                 };
                 unsafeWindow.XMLHttpRequest.prototype.send = function (body) {
                     const site = core.utils.getCurrentSiteInfo();
+                    const method = this._method || 'GET';
+                    if (method === 'POST' && core.utils.isLikelyAssetPayload(body)) {
+                        core.utils.markOutboundAssetSignal({
+                            siteId: site?.id || 'UNKNOWN',
+                            transport: 'xhr',
+                            method,
+                            url: this._url,
+                            bodyType: core.utils.getBodyType(body),
+                        });
+                    }
                     if (site?.apiPaths.some((p) => this._url?.includes(p)) && body && !core.state.isSubmitting) {
                         try {
                             const bodyType = core.utils.getBodyType(body);
@@ -2200,11 +2208,25 @@
                     const url = request ? request.url : String(args[0] || '');
                     const config = args[1] || {};
                     const method = (config.method || request?.method || 'GET').toUpperCase();
+                    const bodySource = config.body !== undefined
+                        ? config.body
+                        : (request ? request.clone() : null);
+                    const headersSource = config.headers !== undefined
+                        ? config.headers
+                        : request?.headers;
+                    const contentType = core.utils.getHeaderValue(headersSource, 'content-type');
+                    if (method === 'POST' && core.utils.isLikelyAssetPayload(bodySource, contentType)) {
+                        core.utils.markOutboundAssetSignal({
+                            siteId: site?.id || 'UNKNOWN',
+                            transport: 'fetch',
+                            method,
+                            url,
+                            bodyType: core.utils.getBodyType(bodySource),
+                            contentType,
+                        });
+                    }
                     if (site?.apiPaths.some((p) => url.includes(p)) && method === 'POST' && !core.state.isSubmitting) {
                         try {
-                            const bodySource = config.body !== undefined
-                                ? config.body
-                                : (request ? request.clone() : null);
                             const bodyType = core.utils.getBodyType(bodySource);
                             const bodyText = await core.utils.bodyToText(bodySource);
                             infra.log(`拦截到 ${site.id} fetch 请求`, {
@@ -2462,7 +2484,7 @@
                         utils.gcMapByAge(state.recentAssetFingerprints, AITabSync.config.TIMINGS.ASSET_DEDUP_WINDOW);
                         const fingerprint = utils.makeDataUrlFingerprint(dataUrl);
                         const lastSeen = state.recentAssetFingerprints.get(fingerprint) || 0;
-                        // 关键注释：内容指纹窗口去重，防止同一资产在 paste/change 链路重复广播。
+                        // 关键注释：内容指纹窗口去重，防止同一资产在 paste 链路重复广播。
                         if (Date.now() - lastSeen < AITabSync.config.TIMINGS.ASSET_DEDUP_WINDOW) {
                             utils.log('跳过重复资产广播（命中内容去重窗口）', { origin, fingerprint, name: file.name });
                             utils.assetTrace('命中内容去重，跳过广播', {
@@ -2510,22 +2532,6 @@
                     }
                 }
                 if (files.length > 0) broadcastFiles(files, 'paste');
-            }, true);
-
-            document.addEventListener('drop', (event) => {
-                if (!event.isTrusted || state.isApplyingRemoteAsset || isSuppressed()) return;
-                utils.assetTrace('监听到 drop 事件');
-                const files = Array.from(event.dataTransfer?.files || []);
-                if (files.length > 0) broadcastFiles(files, 'drop');
-            }, true);
-
-            document.addEventListener('change', (event) => {
-                if (!event.isTrusted || state.isApplyingRemoteAsset || isSuppressed()) return;
-                const target = event.target;
-                if (!(target instanceof HTMLInputElement) || target.type !== 'file') return;
-                utils.assetTrace('监听到 file input change 事件');
-                const files = Array.from(target.files || []);
-                if (files.length > 0) broadcastFiles(files, 'file-input');
             }, true);
         };
 
@@ -2578,126 +2584,52 @@
             state.isApplyingRemoteAsset = true;
             try {
                 const file = utils.createFileFromAsset(asset);
-                const uploadRule = utils.getAssetUploadRule(site.id);
                 utils.assetTrace('开始远端资产注入', {
                     site: site.id,
                     name: file.name,
                     type: file.type,
                     size: file.size,
-                    uploadRule,
                 });
-
-                const isImageAsset = String(asset.mimeType || '').startsWith('image/');
-                const canUsePasteForImage = uploadRule.enablePasteForImage !== false;
-                const canUseFileInput = isImageAsset
-                    ? uploadRule.enableFileInputFallbackForImage !== false
-                    : uploadRule.enableFileInputForNonImage !== false;
-                let inputArea = null;
-
-                const tryDropInjection = async (stage) => {
-                    if (!inputArea) return false;
-                    inputArea.focus();
-                    const before = utils.takeAssetDomSnapshot(inputArea);
-                    utils.dispatchDropWithFile(inputArea, file);
-                    await new Promise((resolve) => setTimeout(resolve, config.TIMINGS.PASTE_VERIFY_DELAY));
-                    const after = utils.takeAssetDomSnapshot(inputArea);
-                    const dropVerified = utils.isAssetLikelyAttached(before, after);
-                    utils.assetTrace('drop 注入后校验结果', {
+                const channelToggles = state.assetChannelToggles || {};
+                const isPasteChannelEnabled = channelToggles.paste !== false;
+                if (!isPasteChannelEnabled) {
+                    utils.assetTrace('paste 通道已关闭，结束注入流程', {
                         site: site.id,
-                        stage,
-                        dropVerified,
-                        before,
-                        after,
-                    });
-                    return dropVerified;
-                };
-
-                if (isImageAsset && canUsePasteForImage) {
-                    inputArea = await utils.waitFor(() => utils.findBestInputArea(site), config.TIMINGS.SUBMIT_TIMEOUT, '输入框');
-                    inputArea.focus();
-                    const pasteBefore = utils.takeAssetDomSnapshot(inputArea);
-                    utils.dispatchPasteWithFile(inputArea, file);
-                    await new Promise((resolve) => setTimeout(resolve, config.TIMINGS.PASTE_VERIFY_DELAY));
-                    const pasteAfter = utils.takeAssetDomSnapshot(inputArea);
-                    const pasteVerified = utils.isAssetLikelyAttached(pasteBefore, pasteAfter);
-                    utils.assetTrace('paste 注入后校验结果', {
-                        site: site.id,
-                        pasteVerified,
-                        pasteBefore,
-                        pasteAfter,
-                    });
-                    if (pasteVerified) {
-                        utils.assetTrace('paste 注入已生效，结束流程', { site: site.id });
-                        return;
-                    }
-
-                    const dropAfterPasteVerified = await tryDropInjection('image-after-paste');
-                    if (dropAfterPasteVerified) {
-                        utils.assetTrace('drop 注入已生效，结束流程', { site: site.id, stage: 'image-after-paste' });
-                        return;
-                    }
-                }
-
-                if (canUseFileInput) {
-                    let fileInput = utils.findBestFileInput(file);
-                    if (!fileInput) {
-                        utils.assetTrace('未立即找到可用 file input，尝试触发上传入口', { site: site.id });
-                        fileInput = await utils.discoverFileInputViaTrigger(file, config.TIMINGS.FILE_INPUT_DISCOVERY_TIMEOUT);
-                    }
-
-                    if (fileInput) {
-                        fileInput.focus();
-                        const fileInputBefore = utils.takeAssetDomSnapshot(fileInput);
-                        const changed = utils.dispatchFileInputChange(fileInput, file);
-                        await new Promise((resolve) => setTimeout(resolve, config.TIMINGS.FILE_INPUT_VERIFY_DELAY));
-                        const fileInputAfter = utils.takeAssetDomSnapshot(fileInput);
-                        const fileInputVerified = !!(fileInput.files && fileInput.files.length > 0)
-                            || utils.isAssetLikelyAttached(fileInputBefore, fileInputAfter);
-                        utils.assetTrace('file input 注入后校验结果', {
-                            site: site.id,
-                            changed,
-                            fileInputVerified,
-                            fileInputBefore,
-                            fileInputAfter,
-                        });
-                        if (fileInputVerified) {
-                            utils.assetTrace('file input 注入已生效，结束流程', { site: site.id });
-                            return;
-                        }
-                    } else {
-                        utils.assetTrace('未找到可用 file input，无法执行 file input 注入', { site: site.id });
-                    }
-                }
-
-                if (!inputArea) {
-                    try {
-                        inputArea = await utils.waitFor(() => utils.findBestInputArea(site), config.TIMINGS.FILE_INPUT_DISCOVERY_TIMEOUT, '输入框');
-                    } catch (e) { }
-                }
-
-                if (inputArea) {
-                    const dropFinalVerified = await tryDropInjection(isImageAsset ? 'image-final' : 'non-image-final');
-                    if (dropFinalVerified) {
-                        utils.assetTrace('最终 drop 注入已生效，结束流程', {
-                            site: site.id,
-                            stage: isImageAsset ? 'image-final' : 'non-image-final'
-                        });
-                        return;
-                    }
-                }
-
-                if (!canUseFileInput) {
-                    utils.assetTrace('当前资产类型按站点规则禁用 file input，结束注入流程', {
-                        site: site.id,
-                        isImageAsset,
-                    });
-                } else {
-                    utils.assetTrace('资产注入未通过任何通道校验', {
-                        site: site.id,
-                        isImageAsset,
                         fileName: file.name,
                     });
+                    return;
                 }
+
+                const inputArea = await utils.waitFor(() => utils.findBestInputArea(site), config.TIMINGS.SUBMIT_TIMEOUT, '输入框');
+                inputArea.focus();
+                const pasteBefore = utils.takeAssetDomSnapshot(inputArea);
+                const pasteStartedAt = Date.now();
+                utils.dispatchPasteWithFile(inputArea, file);
+                await new Promise((resolve) => setTimeout(resolve, config.TIMINGS.PASTE_VERIFY_DELAY));
+                const pasteAfter = utils.takeAssetDomSnapshot(inputArea);
+                const pasteVerifiedByDom = utils.isAssetLikelyAttached(pasteBefore, pasteAfter);
+                const pasteVerifiedByNetwork = pasteVerifiedByDom
+                    ? false
+                    : await utils.waitForOutboundAssetSignal(pasteStartedAt, config.TIMINGS.ASSET_NETWORK_VERIFY_WINDOW);
+                const pasteVerified = pasteVerifiedByDom || pasteVerifiedByNetwork;
+                utils.assetTrace('paste 注入后校验结果', {
+                    site: site.id,
+                    pasteVerified,
+                    pasteVerifiedByDom,
+                    pasteVerifiedByNetwork,
+                    pasteBefore,
+                    pasteAfter,
+                });
+
+                if (pasteVerified) {
+                    utils.assetTrace('paste 注入已生效，结束流程', { site: site.id });
+                    return;
+                }
+
+                utils.assetTrace('资产注入未通过 paste 通道校验', {
+                    site: site.id,
+                    fileName: file.name,
+                });
             } catch (error) {
                 utils.log('应用远端资产失败', error);
                 utils.assetTrace('远端资产注入异常', error);
