@@ -100,6 +100,8 @@
             tooltipTimeoutId: null,
             animationStyle: 'spin',
             isSelectionSynced: true,
+            isStrictModeEnabled: false,
+            strictModeMenuCommandId: null,
         },
 
         // --- 2. Configuration ---
@@ -116,6 +118,7 @@
                 ANIMATION_STYLE: 'multi_sync_animation_style_v1.0',
                 SELECTION_SYNC_ENABLED: 'multi_sync_selection_sync_v1.0',
                 SHARED_SELECTION: 'multi_sync_shared_selection_v1.0',
+                STRICT_MODE_ENABLED: 'multi_sync_strict_mode_v1.0',
             },
             TIMINGS: {
                 HEARTBEAT_INTERVAL: 5000,
@@ -1559,975 +1562,1251 @@
                 const { state } = AITabSync;
                 if (state.menuCommandId) GM_unregisterMenuCommand(state.menuCommandId);
                 if (state.assetTraceMenuCommandId) GM_unregisterMenuCommand(state.assetTraceMenuCommandId);
+                if (state.strictModeMenuCommandId) GM_unregisterMenuCommand(state.strictModeMenuCommandId);
                 const label = state.isLoggingEnabled ? '停用调试日志' : '启用调试日志';
                 state.menuCommandId = GM_registerMenuCommand(label, AITabSync.events.onToggleLogging);
                 const assetLabel = state.isAssetTraceEnabled ? '停用资产链路日志' : '启用资产链路日志';
                 state.assetTraceMenuCommandId = GM_registerMenuCommand(assetLabel, AITabSync.events.onToggleAssetTrace);
+                const strictLabel = state.isStrictModeEnabled ? '停用严格模式' : '启用严格模式';
+                state.strictModeMenuCommandId = GM_registerMenuCommand(strictLabel, AITabSync.events.onToggleStrictMode);
             },
         },
 
         // --- 6. Event Handlers ---
         events: {
-            register() {
-                const { elements, ui } = AITabSync;
-                elements.fab.addEventListener('click', (e) => {
-                    e.stopPropagation();
-                    ui.togglePanelVisibility();
-                });
-                elements.container.addEventListener('click', this.onChipClick);
-                elements.container.querySelector('#ai-sync-select-all-btn').addEventListener('click', this.onSelectAllClick);
-                elements.container.querySelector('#ai-sync-settings-btn').addEventListener('click', () => {
-                    if (elements.settingsModal) elements.settingsModal.style.display = 'flex';
-                });
-                elements.settingsModal.addEventListener('click', (e) => {
-                    if (e.target === elements.settingsModal) elements.settingsModal.style.display = 'none';
-                });
-                elements.settingsModal.querySelector('.ai-sync-settings-list').addEventListener('change', this.onSettingsChange);
-                elements.settingsModal.querySelector('#ai-sync-animation-toggle').addEventListener('change', this.onAnimationToggleChange);
-                elements.settingsModal.querySelector('#ai-sync-selection-sync-toggle').addEventListener('change', this.onSelectionSyncToggleChange);
-                elements.container.addEventListener('mouseover', this.onChipMouseOver, true);
-                elements.container.addEventListener('mouseout', this.onChipMouseOut, true);
-            },
-            async onChipClick(event) {
-                if (event.target.matches('.ai-sync-chip')) {
-                    const { config, state, ui, utils } = AITabSync;
-                    const chip = event.target;
-                    const siteId = chip.dataset.siteId;
-                    const siteInfo = config.SITES[siteId];
-                    if (!siteInfo) return;
-                    if (state.selectedTargets.has(siteId)) {
-                        state.selectedTargets.delete(siteId);
-                        if (state.isSelectionSynced && state.selectedTargets.size === 1 && state.selectedTargets.has(state.thisSite.id)) {
-                            state.selectedTargets.clear();
-                        }
-                    } else {
-                        state.selectedTargets.add(siteId);
-                        if (state.isSelectionSynced) {
-                            state.selectedTargets.add(state.thisSite.id);
-                        }
-                        const activeTabs = JSON.parse(await GM_getValue(config.KEYS.ACTIVE_TABS, '{}'));
-                        if (!activeTabs[siteId]) {
-                            utils.log(`打开新标签页: ${siteId}`);
-                            window.open(siteInfo.url, `ai_sync_window_for_${siteId}`);
-                        }
-                    }
-                    ui.updatePanelState();
-                    ui.updateSelectAllButtonState();
-                    if (state.isSelectionSynced) {
-                        await GM_setValue(config.KEYS.SHARED_SELECTION, JSON.stringify(Array.from(state.selectedTargets)));
-                    }
-                } else if (event.target === AITabSync.elements.container) {
-                    AITabSync.ui.togglePanelVisibility();
-                }
-            },
-            async onSelectAllClick() {
-                const { config, state, ui, utils } = AITabSync;
-                const visibleTargets = config.DISPLAY_ORDER.filter(id => state.visibleTargets.includes(id) && id !== state.thisSite.id);
-                const allSelected = visibleTargets.length > 0 && visibleTargets.every(id => state.selectedTargets.has(id));
-                if (allSelected) {
-                    state.selectedTargets.clear();
-                } else {
-                    const activeTabs = JSON.parse(await GM_getValue(config.KEYS.ACTIVE_TABS, '{}'));
-                    visibleTargets.forEach(siteId => {
-                        state.selectedTargets.add(siteId);
-                        const siteInfo = config.SITES[siteId];
-                        if (!activeTabs[siteId] && siteInfo) {
-                            utils.log(`(全选) 打开新标签页: ${siteId}`);
-                            window.open(siteInfo.url, `ai_sync_window_for_${siteId}`);
-                        }
-                    });
-                    if (state.isSelectionSynced) {
-                        state.selectedTargets.add(state.thisSite.id);
-                    }
-                }
-                ui.updatePanelState();
-                ui.updateSelectAllButtonState();
-                if (state.isSelectionSynced) {
-                    await GM_setValue(config.KEYS.SHARED_SELECTION, JSON.stringify(Array.from(state.selectedTargets)));
-                }
-            },
-            async onSettingsChange(event) {
-                if (event.target.type !== 'checkbox') return;
-                const { config, state, ui } = AITabSync;
-                const list = event.currentTarget;
-                const checkboxes = list.querySelectorAll('input[type="checkbox"]:checked');
-                const newVisibleTargets = Array.from(checkboxes).map((cb) => cb.value);
-                await GM_setValue(config.KEYS.VISIBLE_TARGETS, newVisibleTargets);
-                state.visibleTargets = newVisibleTargets;
-                const oldTargets = config.DISPLAY_ORDER;
-                oldTargets.forEach((id) => {
-                    if (!newVisibleTargets.includes(id) && state.selectedTargets.has(id)) state.selectedTargets.delete(id);
-                });
-                ui.rebuildChipsUI();
-            },
-            async onAnimationToggleChange(event) {
-                const { state, config, elements, utils } = AITabSync;
-                const isSpinEnabled = event.target.checked;
-                const newStyle = isSpinEnabled ? 'spin' : 'aurora';
-                if (state.animationStyle === newStyle) return;
-                await GM_setValue(config.KEYS.ANIMATION_STYLE, newStyle);
-                state.animationStyle = newStyle;
-                utils.log(`动画样式已切换为: ${newStyle}`);
-                elements.fab.classList.remove('animation-aurora', 'animation-spin', 'intro-playing');
-                elements.fab.classList.add(isSpinEnabled ? 'animation-spin' : 'animation-aurora');
-                if (isSpinEnabled) {
-                    elements.fab.classList.add('intro-playing');
-                }
-            },
-            async onSelectionSyncToggleChange(event) {
-                const { state, config, utils } = AITabSync;
-                const isEnabled = event.target.checked;
-                state.isSelectionSynced = isEnabled;
-                await GM_setValue(config.KEYS.SELECTION_SYNC_ENABLED, isEnabled);
-                utils.log(`选择状态同步已 ${isEnabled ? '开启' : '关闭'}.`);
-                if (!isEnabled) {
-                    GM_deleteValue(config.KEYS.SHARED_SELECTION);
-                }
-            },
-            onClickOutside(event) {
-                const { container } = AITabSync.elements;
-                if (container && !container.contains(event.target) && container.classList.contains('expanded')) {
-                    AITabSync.ui.togglePanelVisibility();
-                }
-            },
-            onChipMouseOver(event) {
-                if (!event.target.matches('.ai-sync-chip')) return;
-                const { state, config, elements } = AITabSync;
-                const chip = event.target;
-                const siteId = chip.dataset.siteId;
-                let tooltipText = state.selectedTargets.has(siteId) ? '已选中 (点击取消)' : (chip.classList.contains('online') ? '待发送 (点击选中)' : '点击启动');
-                state.tooltipTimeoutId = setTimeout(() => {
-                    elements.tooltip.textContent = tooltipText;
-                    const chipRect = chip.getBoundingClientRect();
-                    elements.tooltip.style.left = `${chipRect.left + chipRect.width / 2}px`;
-                    elements.tooltip.style.top = `${chipRect.top}px`;
-                    elements.tooltip.style.display = 'block';
-                }, config.TIMINGS.TOOLTIP_DELAY);
-            },
-            onChipMouseOut(event) {
-                if (!event.target.matches('.ai-sync-chip')) return;
-                clearTimeout(AITabSync.state.tooltipTimeoutId);
-                AITabSync.elements.tooltip.style.display = 'none';
-            },
-            async onToggleLogging() {
-                const { state, ui } = AITabSync;
-                state.isLoggingEnabled = !state.isLoggingEnabled;
-                await GM_setValue(AITabSync.config.KEYS.LOGGING_ENABLED, state.isLoggingEnabled);
-                alert(`[AI Sync] 调试日志 ${state.isLoggingEnabled ? '已开启' : '已关闭'}。`);
-                ui.updateMenuCommand();
-            },
-            async onToggleAssetTrace() {
-                const { state, ui } = AITabSync;
-                state.isAssetTraceEnabled = !state.isAssetTraceEnabled;
-                await GM_setValue(AITabSync.config.KEYS.ASSET_TRACE_ENABLED, state.isAssetTraceEnabled);
-                alert(`[AI Sync] 资产链路日志 ${state.isAssetTraceEnabled ? '已开启' : '已关闭'}。`);
-                ui.updateMenuCommand();
-            },
+            register() { return EventsModule.register(); },
+            async onChipClick(event) { return EventsModule.onChipClick(event); },
+            async onSelectAllClick() { return EventsModule.onSelectAllClick(); },
+            async onSettingsChange(event) { return EventsModule.onSettingsChange(event); },
+            async onAnimationToggleChange(event) { return EventsModule.onAnimationToggleChange(event); },
+            async onSelectionSyncToggleChange(event) { return EventsModule.onSelectionSyncToggleChange(event); },
+            onClickOutside(event) { return EventsModule.onClickOutside(event); },
+            onChipMouseOver(event) { return EventsModule.onChipMouseOver(event); },
+            onChipMouseOut(event) { return EventsModule.onChipMouseOut(event); },
+            async onToggleLogging() { return EventsModule.onToggleLogging(); },
+            async onToggleAssetTrace() { return EventsModule.onToggleAssetTrace(); },
+            async onToggleStrictMode() { return EventsModule.onToggleStrictMode(); },
         },
 
         // --- 7. Lifecycle & Background Tasks ---
         lifecycle: {
-            ensureWindowName() {
-                const { thisSite } = AITabSync.state;
-                if (!thisSite) return;
-                const expectedName = `ai_sync_window_for_${thisSite.id}`;
-                if (window.name !== expectedName) window.name = expectedName;
-            },
-            deployHistoryInterceptor() {
-                const { thisSite } = AITabSync.state;
-                if (!thisSite) return;
-                const originalPushState = history.pushState;
-                const originalReplaceState = history.replaceState;
-                let lastUrl = location.href;
-                const handleUrlChange = () => {
-                    setTimeout(() => {
-                        if (location.href !== lastUrl) {
-                            lastUrl = location.href;
-                            this.ensureWindowName();
-                            this.registerTabAsActive();
-                        }
-                    }, 100);
-                };
-                history.pushState = function (...args) {
-                    originalPushState.apply(this, args);
-                    handleUrlChange();
-                };
-                history.replaceState = function (...args) {
-                    originalReplaceState.apply(this, args);
-                    handleUrlChange();
-                };
-                window.addEventListener('popstate', handleUrlChange);
-            },
-            async registerTabAsActive() {
-                const { thisSite } = AITabSync.state;
-                if (!thisSite) return;
-                try {
-                    const activeTabs = JSON.parse(await GM_getValue(AITabSync.config.KEYS.ACTIVE_TABS, '{}'));
-                    activeTabs[thisSite.id] = { url: window.location.href, timestamp: Date.now() };
-                    await GM_setValue(AITabSync.config.KEYS.ACTIVE_TABS, JSON.stringify(activeTabs));
-                } catch (e) {
-                    AITabSync.utils.log('心跳注册失败:', e);
-                }
-            },
-            async unregisterTabAsInactive() {
-                const { thisSite } = AITabSync.state;
-                if (!thisSite) return;
-                try {
-                    const key = AITabSync.config.KEYS.ACTIVE_TABS;
-                    const activeTabs = JSON.parse(await GM_getValue(key, '{}'));
-                    if (activeTabs[thisSite.id]) {
-                        delete activeTabs[thisSite.id];
-                        await GM_setValue(key, JSON.stringify(activeTabs));
-                    }
-                } catch (e) { }
-            },
-            async cleanupStaleTabs() {
-                try {
-                    const activeTabs = JSON.parse(await GM_getValue(AITabSync.config.KEYS.ACTIVE_TABS, '{}'));
-                    const now = Date.now();
-                    let hasChanged = false;
-                    for (const siteId in activeTabs) {
-                        if (Object.prototype.hasOwnProperty.call(activeTabs, siteId)) {
-                            const tabInfo = activeTabs[siteId];
-                            if (typeof tabInfo !== 'object' || tabInfo === null || now - tabInfo.timestamp > AITabSync.config.TIMINGS.STALE_THRESHOLD) {
-                                delete activeTabs[siteId];
-                                hasChanged = true;
-                            }
-                        }
-                    }
-                    if (hasChanged) await GM_setValue(AITabSync.config.KEYS.ACTIVE_TABS, JSON.stringify(activeTabs));
-                } catch (e) { }
-            },
+            ensureWindowName() { return LifecycleModule.ensureWindowName(); },
+            deployHistoryInterceptor() { return LifecycleModule.deployHistoryInterceptor(); },
+            async registerTabAsActive() { return LifecycleModule.registerTabAsActive(); },
+            async unregisterTabAsInactive() { return LifecycleModule.unregisterTabAsInactive(); },
+            async cleanupStaleTabs() { return LifecycleModule.cleanupStaleTabs(); },
         },
 
-        // --- 8. Communication Module ---
+        // --- 8. Communication Module (IIFE 装配层) ---
         comms: {
-            deployNetworkInterceptor() {
-                const { thisSite } = AITabSync.state;
-                if (!thisSite?.queryExtractor) return;
-                const { send } = unsafeWindow.XMLHttpRequest.prototype;
-                if (!send._isHooked) {
-                    const { open } = unsafeWindow.XMLHttpRequest.prototype;
-                    unsafeWindow.XMLHttpRequest.prototype.open = function (method, url, ...args) {
-                        this._url = url;
-                        return open.apply(this, [method, url, ...args]);
-                    };
-                    unsafeWindow.XMLHttpRequest.prototype.send = function (body) {
-                        const site = AITabSync.utils.getCurrentSiteInfo();
-                        if (site?.apiPaths.some((p) => this._url?.includes(p)) && body && !AITabSync.state.isSubmitting) {
-                            try {
-                                const bodyType = AITabSync.utils.getBodyType(body);
-                                const bodyText = typeof body === 'string'
-                                    ? body
-                                    : (typeof URLSearchParams !== 'undefined' && body instanceof URLSearchParams ? body.toString() : '');
-                                AITabSync.utils.log(`拦截到 ${site.id} XHR 请求`, {
-                                    url: this._url,
-                                    bodyType,
-                                    preview: bodyText.slice(0, 200)
-                                });
-                                if (bodyText) {
-                                    const query = site.queryExtractor(bodyText);
-                                    if (query) {
-                                        AITabSync.utils.log(`从 ${site.id} XHR 请求提取到问题`, query);
-                                        AITabSync.comms.handleQueryFound(query, site);
-                                    } else {
-                                        AITabSync.utils.log(`命中 ${site.id} XHR 请求，但未提取到问题`, {
-                                            url: this._url,
-                                            bodyType,
-                                            preview: bodyText.slice(0, 200)
-                                        });
-                                    }
-                                } else {
-                                    AITabSync.utils.log(`命中 ${site.id} XHR 请求，但请求体类型暂不支持读取`, {
-                                        url: this._url,
-                                        bodyType
-                                    });
-                                }
-                            } catch (e) {
-                                AITabSync.utils.log(`解析 ${site.id} XHR 请求失败`, e);
-                            }
-                        }
-                        return send.apply(this, arguments);
-                    };
-                    unsafeWindow.XMLHttpRequest.prototype.send._isHooked = true;
-                }
-                const { fetch } = unsafeWindow;
-                if (!fetch._isHooked) {
-                    unsafeWindow.fetch = async function (...args) {
-                        const site = AITabSync.utils.getCurrentSiteInfo();
-                        const request = args[0] instanceof Request ? args[0] : null;
-                        const url = request ? request.url : String(args[0] || '');
-                        const config = args[1] || {};
-                        const method = (config.method || request?.method || 'GET').toUpperCase();
-                        if (site?.apiPaths.some((p) => url.includes(p)) && method === 'POST' && !AITabSync.state.isSubmitting) {
-                            try {
-                                const bodySource = config.body !== undefined
-                                    ? config.body
-                                    : (request ? request.clone() : null);
-                                const bodyType = AITabSync.utils.getBodyType(bodySource);
-                                const bodyText = await AITabSync.utils.bodyToText(bodySource);
-                                AITabSync.utils.log(`拦截到 ${site.id} fetch 请求`, {
-                                    url,
-                                    method,
-                                    bodyType,
-                                    preview: bodyText.slice(0, 200)
-                                });
-                                if (bodyText) {
-                                    const query = site.queryExtractor(bodyText);
-                                    if (query) {
-                                        AITabSync.utils.log(`从 ${site.id} fetch 请求提取到问题`, query);
-                                        AITabSync.comms.handleQueryFound(query, site);
-                                    } else {
-                                        AITabSync.utils.log(`命中 ${site.id} fetch 请求，但未提取到问题`, {
-                                            url,
-                                            method,
-                                            bodyType,
-                                            preview: bodyText.slice(0, 200)
-                                        });
-                                    }
-                                } else {
-                                    AITabSync.utils.log(`命中 ${site.id} fetch 请求，但请求体为空或无法读取`, {
-                                        url,
-                                        method,
-                                        bodyType
-                                    });
-                                }
-                            } catch (e) {
-                                AITabSync.utils.log(`解析 ${site?.id || 'UNKNOWN'} fetch 请求失败`, e);
-                            }
-                        }
-                        return fetch.apply(this, args);
-                    };
-                    unsafeWindow.fetch._isHooked = true;
-                }
-            },
-            deployLocalSendFallback() {
-                const { utils, state } = AITabSync;
-
-                const shouldSkipBecauseSuppressed = () => Date.now() < state.suppressNextLocalSendCaptureUntil;
-
-                const readInputContent = (inputArea) => {
-                    if (!inputArea) return '';
-                    if (inputArea.tagName === 'TEXTAREA') return (inputArea.value || '').trim();
-                    return (inputArea.textContent || '').trim();
-                };
-
-                const canTreatAsInputArea = (element) => {
-                    if (!element) return false;
-                    if (element.tagName === 'TEXTAREA') return true;
-                    if (element.isContentEditable || element.getAttribute('contenteditable') === 'true') return true;
-                    return false;
-                };
-
-                const broadcastIfValid = (query) => {
-                    const q = String(query || '').trim();
-                    if (!q || shouldSkipBecauseSuppressed()) return;
-                    this.handleQueryFound(q, state.thisSite);
-                };
-
-                document.addEventListener('keydown', (event) => {
-                    if (!event.isTrusted || state.isSubmitting || shouldSkipBecauseSuppressed()) return;
-                    const target = event.target;
-                    if (!(target instanceof Element) || !canTreatAsInputArea(target)) return;
-                    const isEnter = event.key === 'Enter';
-                    if (!isEnter) return;
-                    if (event.shiftKey || event.altKey) return;
-
-                    const isModifierSend = event.ctrlKey || event.metaKey;
-                    const siteId = state.thisSite?.id;
-                    const isStudio = siteId === 'AI_STUDIO';
-
-                    if (isStudio && !isModifierSend) return;
-
-                    const query = readInputContent(target);
-                    if (!query) return;
-
-                    setTimeout(() => broadcastIfValid(query), 0);
-                }, true);
-
-                document.addEventListener('click', (event) => {
-                    if (!event.isTrusted || state.isSubmitting || shouldSkipBecauseSuppressed()) return;
-                    const target = event.target;
-                    if (!(target instanceof Element)) return;
-                    const clickable = target.closest('button,[role="button"],[aria-label*="发送"],[aria-label*="Send"],[data-testid*="send"],.send-button');
-                    if (!clickable) return;
-
-                    const inputArea = utils.findBestInputArea(state.thisSite);
-                    const query = readInputContent(inputArea);
-                    if (!query) return;
-
-                    setTimeout(() => {
-                        const latestInput = utils.findBestInputArea(state.thisSite);
-                        const latestContent = readInputContent(latestInput);
-                        if (!latestContent) {
-                            broadcastIfValid(query);
-                        }
-                    }, 120);
-                }, true);
-            },
-            deployAssetSyncListeners() {
-                const { utils, state } = AITabSync;
-                const isSuppressed = () => Date.now() < state.suppressLocalAssetCaptureUntil;
-
-                const broadcastFiles = async (files, origin) => {
-                    const sourceSite = state.thisSite;
-                    const targets = Array.from(state.selectedTargets);
-                    if (!sourceSite || targets.length === 0 || !files?.length || isSuppressed()) return;
-
-                    const fileList = Array.from(files).filter(Boolean);
-                    if (fileList.length === 0) return;
-
-                    utils.assetTrace('捕获本地资产事件', {
-                        origin,
-                        site: sourceSite.id,
-                        targets,
-                        fileCount: fileList.length,
-                        files: fileList.slice(0, 5).map((file) => ({
-                            name: file.name,
-                            type: file.type,
-                            size: file.size,
-                            lastModified: file.lastModified,
-                        })),
-                    });
-
-                    try {
-                        const assetsToBroadcast = [];
-                        for (const file of fileList) {
-                            const dataUrl = await utils.fileToDataUrl(file);
-                            utils.gcMapByAge(state.recentAssetFingerprints, AITabSync.config.TIMINGS.ASSET_DEDUP_WINDOW);
-                            const fingerprint = utils.makeDataUrlFingerprint(dataUrl);
-                            const lastSeen = state.recentAssetFingerprints.get(fingerprint) || 0;
-                            if (Date.now() - lastSeen < AITabSync.config.TIMINGS.ASSET_DEDUP_WINDOW) {
-                                utils.log('跳过重复资产广播（命中内容去重窗口）', { origin, fingerprint, name: file.name });
-                                utils.assetTrace('命中内容去重，跳过广播', {
-                                    origin,
-                                    fingerprint,
-                                    name: file.name,
-                                    ageMs: Date.now() - lastSeen
-                                });
-                                continue;
-                            }
-                            state.recentAssetFingerprints.set(fingerprint, Date.now());
-                            assetsToBroadcast.push({
-                                name: file.name,
-                                mimeType: file.type || 'application/octet-stream',
-                                size: file.size || 0,
-                                dataUrl,
-                                origin,
-                            });
-                        }
-
-                        if (assetsToBroadcast.length === 0) return;
-
-                        utils.assetTrace('通过内容去重检查，准备广播', {
-                            origin,
-                            count: assetsToBroadcast.length,
-                        });
-
-                        await this.handleAssetFound(assetsToBroadcast, sourceSite, targets);
-                    } catch (error) {
-                        utils.log('资产同步读取失败', error);
-                    }
-                };
-
-                document.addEventListener('paste', (event) => {
-                    if (!event.isTrusted || state.isApplyingRemoteAsset || isSuppressed()) return;
-                    utils.assetTrace('监听到 paste 事件');
-                    const items = event.clipboardData?.items;
-                    if (!items?.length) return;
-                    const files = [];
-                    for (let i = 0; i < items.length; i++) {
-                        const item = items[i];
-                        if (item.kind === 'file') {
-                            const file = item.getAsFile();
-                            if (file) files.push(file);
-                        }
-                    }
-                    if (files.length > 0) {
-                        broadcastFiles(files, 'paste');
-                    }
-                }, true);
-
-                document.addEventListener('drop', (event) => {
-                    if (!event.isTrusted || state.isApplyingRemoteAsset || isSuppressed()) return;
-                    utils.assetTrace('监听到 drop 事件');
-                    const files = Array.from(event.dataTransfer?.files || []);
-                    if (files.length > 0) {
-                        broadcastFiles(files, 'drop');
-                    }
-                }, true);
-
-                document.addEventListener('change', (event) => {
-                    if (!event.isTrusted || state.isApplyingRemoteAsset || isSuppressed()) return;
-                    const target = event.target;
-                    if (!(target instanceof HTMLInputElement) || target.type !== 'file') return;
-                    utils.assetTrace('监听到 file input change 事件');
-                    const files = Array.from(target.files || []);
-                    if (files.length > 0) {
-                        broadcastFiles(files, 'file-input');
-                    }
-                }, true);
-            },
-            async handleAssetFound(assets, sourceSite, targets) {
-                const { utils, config, elements } = AITabSync;
-                if (!sourceSite || !targets?.length) return;
-
-                const normalizedAssets = (Array.isArray(assets) ? assets : [assets]).filter((asset) => !!asset?.dataUrl);
-                if (normalizedAssets.length === 0) return;
-
-                const assetMessageId = `${sourceSite.id}-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
-
-                utils.log(`准备从 ${sourceSite.id} 广播资产`, {
-                    targets,
-                    count: normalizedAssets.length,
-                    assets: normalizedAssets.slice(0, 5).map((asset) => ({
-                        name: asset.name,
-                        mimeType: asset.mimeType,
-                        size: asset.size,
-                        origin: asset.origin,
-                    })),
-                });
-                utils.assetTrace('写入共享资产消息', {
-                    assetMessageId,
-                    sourceId: sourceSite.id,
-                    targets,
-                    count: normalizedAssets.length,
-                });
-
-                if (elements.fab) {
-                    elements.fab.classList.add('sending');
-                    setTimeout(() => elements.fab?.classList.remove('sending'), 2000);
-                }
-
-                await GM_setValue(config.KEYS.SHARED_ASSET, JSON.stringify({
-                    assetMessageId,
-                    timestamp: Date.now(),
-                    sourceId: sourceSite.id,
-                    targetIds: targets,
-                    assetCount: normalizedAssets.length,
-                    assets: normalizedAssets,
-                    asset: normalizedAssets[0]
-                }));
-            },
-            async processSharedAsset(value) {
-                const { state, utils, config } = AITabSync;
-                if (state.isProcessingAssetTask || !value) return;
-                state.isProcessingAssetTask = true;
-
-                try {
-                    const data = JSON.parse(value);
-                    utils.assetTrace('收到共享资产消息', {
-                        sourceId: data.sourceId,
-                        targetIds: data.targetIds,
-                        assetMessageId: data.assetMessageId,
-                        ageMs: Date.now() - data.timestamp,
-                        currentSite: state.thisSite.id,
-                    });
-                    const isExpired = Date.now() - data.timestamp >= config.TIMINGS.ASSET_FRESHNESS_THRESHOLD;
-                    if (isExpired) {
-                        utils.assetTrace('共享资产过期，删除消息', { assetMessageId: data.assetMessageId });
-                        await GM_deleteValue(config.KEYS.SHARED_ASSET);
-                        return;
-                    }
-                    if (!data.targetIds?.includes(state.thisSite.id)) return;
-
-                    utils.gcMapByAge(state.processedAssetMessageIds, config.TIMINGS.ASSET_PROCESSED_ID_TTL);
-                    const messageId = data.assetMessageId || `${data.sourceId || 'unknown'}:${data.timestamp || 0}`;
-                    if (state.processedAssetMessageIds.has(messageId)) {
-                        utils.log('跳过已处理资产消息', { messageId, site: state.thisSite.id });
-                        utils.assetTrace('命中接收端幂等去重，跳过注入', { messageId, site: state.thisSite.id });
-                        return;
-                    }
-                    state.processedAssetMessageIds.set(messageId, Date.now());
-                    utils.assetTrace('通过接收端幂等检查，开始注入', { messageId, site: state.thisSite.id });
-
-                    const incomingAssets = Array.isArray(data.assets) && data.assets.length > 0
-                        ? data.assets
-                        : (data.asset ? [data.asset] : []);
-                    if (incomingAssets.length === 0) {
-                        utils.assetTrace('共享资产消息未包含有效资产数据，跳过', { messageId });
-                        return;
-                    }
-
-                    for (const asset of incomingAssets) {
-                        await this.processAssetSubmission(state.thisSite, asset);
-                    }
-                } catch (error) {
-                    utils.log('处理共享资产失败', error);
-                    utils.assetTrace('处理共享资产异常', error);
-                } finally {
-                    state.isProcessingAssetTask = false;
-                }
-            },
-            async processAssetSubmission(site, asset) {
-                const { utils, state, config } = AITabSync;
-                if (!asset?.dataUrl) return;
-
-                state.isApplyingRemoteAsset = true;
-                try {
-                    const file = utils.createFileFromAsset(asset);
-                    const uploadRule = utils.getAssetUploadRule(site.id);
-                    utils.assetTrace('开始远端资产注入', {
-                        site: site.id,
-                        name: file.name,
-                        type: file.type,
-                        size: file.size,
-                        uploadRule,
-                    });
-
-                    const isImageAsset = String(asset.mimeType || '').startsWith('image/');
-                    const canUsePasteForImage = uploadRule.enablePasteForImage !== false;
-                    const canUseFileInput = isImageAsset
-                        ? uploadRule.enableFileInputFallbackForImage !== false
-                        : uploadRule.enableFileInputForNonImage !== false;
-                    let inputArea = null;
-
-                    const tryDropInjection = async (stage) => {
-                        if (!inputArea) return false;
-                        inputArea.focus();
-                        const before = utils.takeAssetDomSnapshot(inputArea);
-                        utils.dispatchDropWithFile(inputArea, file);
-                        await new Promise((resolve) => setTimeout(resolve, config.TIMINGS.PASTE_VERIFY_DELAY));
-                        const after = utils.takeAssetDomSnapshot(inputArea);
-                        const dropVerified = utils.isAssetLikelyAttached(before, after);
-                        utils.assetTrace('drop 注入后校验结果', {
-                            site: site.id,
-                            stage,
-                            dropVerified,
-                            before,
-                            after,
-                        });
-                        return dropVerified;
-                    };
-
-                    if (isImageAsset && canUsePasteForImage) {
-                        inputArea = await utils.waitFor(() => utils.findBestInputArea(site), config.TIMINGS.SUBMIT_TIMEOUT, '输入框');
-                        inputArea.focus();
-                        const pasteBefore = utils.takeAssetDomSnapshot(inputArea);
-                        utils.dispatchPasteWithFile(inputArea, file);
-                        await new Promise((resolve) => setTimeout(resolve, config.TIMINGS.PASTE_VERIFY_DELAY));
-                        const pasteAfter = utils.takeAssetDomSnapshot(inputArea);
-                        const pasteVerified = utils.isAssetLikelyAttached(pasteBefore, pasteAfter);
-                        utils.assetTrace('paste 注入后校验结果', {
-                            site: site.id,
-                            pasteVerified,
-                            pasteBefore,
-                            pasteAfter,
-                        });
-                        if (pasteVerified) {
-                            utils.assetTrace('paste 注入已生效，结束流程', { site: site.id });
-                            return;
-                        }
-
-                        const dropAfterPasteVerified = await tryDropInjection('image-after-paste');
-                        if (dropAfterPasteVerified) {
-                            utils.assetTrace('drop 注入已生效，结束流程', { site: site.id, stage: 'image-after-paste' });
-                            return;
-                        }
-                    }
-
-                    if (canUseFileInput) {
-                        let fileInput = utils.findBestFileInput(file);
-                        if (!fileInput) {
-                            utils.assetTrace('未立即找到可用 file input，尝试触发上传入口', { site: site.id });
-                            fileInput = await utils.discoverFileInputViaTrigger(file, config.TIMINGS.FILE_INPUT_DISCOVERY_TIMEOUT);
-                        }
-
-                        if (fileInput) {
-                            fileInput.focus();
-                            const fileInputBefore = utils.takeAssetDomSnapshot(fileInput);
-                            const changed = utils.dispatchFileInputChange(fileInput, file);
-                            await new Promise((resolve) => setTimeout(resolve, config.TIMINGS.FILE_INPUT_VERIFY_DELAY));
-                            const fileInputAfter = utils.takeAssetDomSnapshot(fileInput);
-                            const fileInputVerified = !!(fileInput.files && fileInput.files.length > 0)
-                                || utils.isAssetLikelyAttached(fileInputBefore, fileInputAfter);
-                            utils.assetTrace('file input 注入后校验结果', {
-                                site: site.id,
-                                changed,
-                                fileInputVerified,
-                                fileInputBefore,
-                                fileInputAfter,
-                            });
-                            if (fileInputVerified) {
-                                utils.assetTrace('file input 注入已生效，结束流程', { site: site.id });
-                                return;
-                            }
-                        } else {
-                            utils.assetTrace('未找到可用 file input，无法执行 file input 注入', { site: site.id });
-                        }
-                    }
-
-                    if (!inputArea) {
-                        try {
-                            inputArea = await utils.waitFor(() => utils.findBestInputArea(site), config.TIMINGS.FILE_INPUT_DISCOVERY_TIMEOUT, '输入框');
-                        } catch (e) { }
-                    }
-
-                    if (inputArea) {
-                        const dropFinalVerified = await tryDropInjection(isImageAsset ? 'image-final' : 'non-image-final');
-                        if (dropFinalVerified) {
-                            utils.assetTrace('最终 drop 注入已生效，结束流程', {
-                                site: site.id,
-                                stage: isImageAsset ? 'image-final' : 'non-image-final'
-                            });
-                            return;
-                        }
-                    }
-
-                    if (!canUseFileInput) {
-                        utils.assetTrace('当前资产类型按站点规则禁用 file input，结束注入流程', {
-                            site: site.id,
-                            isImageAsset,
-                        });
-                    } else {
-                        utils.assetTrace('资产注入未通过任何通道校验', {
-                            site: site.id,
-                            isImageAsset,
-                            fileName: file.name,
-                        });
-                    }
-                } catch (error) {
-                    utils.log('应用远端资产失败', error);
-                    utils.assetTrace('远端资产注入异常', error);
-                } finally {
-                    state.suppressLocalAssetCaptureUntil = Date.now() + config.TIMINGS.REMOTE_ASSET_SUPPRESS_WINDOW;
-                    utils.assetTrace('设置本地资产捕获抑制窗口', {
-                        site: site.id,
-                        suppressMs: config.TIMINGS.REMOTE_ASSET_SUPPRESS_WINDOW,
-                    });
-                    setTimeout(() => {
-                        state.isApplyingRemoteAsset = false;
-                    }, config.TIMINGS.REMOTE_ASSET_SUPPRESS_WINDOW);
-                }
-            },
-            async handleQueryFound(query, sourceSite) {
-                const { utils, state, config, elements } = AITabSync;
-                const targets = Array.from(state.selectedTargets);
-                if (targets.length === 0) return;
-                utils.log(`准备从 ${sourceSite.id} 广播问题`, {
-                    targets,
-                    preview: query.slice(0, 120)
-                });
-                if (elements.fab) {
-                    elements.fab.classList.add('sending');
-                    setTimeout(() => elements.fab?.classList.remove('sending'), 2000);
-                }
-                await GM_setValue(config.KEYS.SHARED_QUERY, JSON.stringify({
-                    query,
-                    timestamp: Date.now(),
-                    sourceId: sourceSite.id,
-                    targetIds: targets
-                }));
-            },
-            async processSharedQuery(value) {
-                const { state, utils, config } = AITabSync;
-                if (state.isProcessingQueryTask || !value) return;
-                state.isProcessingQueryTask = true;
-                try {
-                    const data = JSON.parse(value);
-                    utils.log(`收到共享问题，当前站点 ${state.thisSite.id}`, {
-                        sourceId: data.sourceId,
-                        targetIds: data.targetIds,
-                        ageMs: Date.now() - data.timestamp,
-                        preview: String(data.query || '').slice(0, 120)
-                    });
-                    if (!data.targetIds?.includes(state.thisSite.id) || Date.now() - data.timestamp >= config.TIMINGS.FRESHNESS_THRESHOLD) {
-                        utils.log(`跳过共享问题，当前站点 ${state.thisSite.id} 不在目标列表或消息已过期`);
-                        return;
-                    }
-                    const remainingTargets = data.targetIds.filter((id) => id !== state.thisSite.id);
-                    if (remainingTargets.length > 0) {
-                        await GM_setValue(config.KEYS.SHARED_QUERY, JSON.stringify({ ...data, targetIds: remainingTargets }));
-                    } else {
-                        await GM_deleteValue(config.KEYS.SHARED_QUERY);
-                    }
-                    await this.processSubmission(state.thisSite, data.query);
-                } catch (e) {
-                    await GM_deleteValue(config.KEYS.SHARED_QUERY);
-                } finally {
-                    state.isProcessingQueryTask = false;
-                }
-            },
-            async processSubmission(site, query) {
-                const { utils, config, state } = AITabSync;
-                const inputArea = await utils.waitFor(() => utils.findBestInputArea(site), config.TIMINGS.SUBMIT_TIMEOUT, '输入框');
-                utils.log(`开始向 ${site.id} 注入问题`, {
-                    input: utils.getElementDescriptor(inputArea),
-                    preview: query.slice(0, 120)
-                });
-                utils.simulateInput(inputArea, query);
-                state.suppressNextLocalSendCaptureUntil = Date.now() + 3000;
-                await new Promise((resolve) => setTimeout(resolve, config.TIMINGS.HUMAN_LIKE_DELAY));
-                try {
-                    state.isSubmitting = true;
-                    if (site.id === 'QWEN') {
-                        const sendButton = document.querySelector('div.omni-button-content button.ant-btn-primary')
-                            || document.querySelector('div.omni-button-content button');
-                        if (sendButton && !sendButton.disabled && !sendButton.classList.contains('disabled')) {
-                            sendButton.click();
-                            setTimeout(() => (state.isSubmitting = false), 2000);
-                            return;
-                        }
-                    }
-                    if (site.id === 'AI_STUDIO') {
-                        const sendButton = utils.deepQuerySelector('run-button button[aria-label="Run"]')
-                            || utils.deepQuerySelector('button[aria-label="Run"]')
-                            || utils.deepQuerySelector('button[aria-label="Submit"]');
-                        if (sendButton && !sendButton.disabled) {
-                            sendButton.click();
-                            setTimeout(() => (state.isSubmitting = false), 2000);
-                            return;
-                        }
-                    }
-                    const isMac = navigator.platform.toUpperCase().indexOf('MAC') >= 0;
-                    const eventType = 'keydown';
-                    const useModifierKey = site.id === 'AI_STUDIO';
-                    inputArea.dispatchEvent(new KeyboardEvent(eventType, {
-                        key: 'Enter',
-                        code: 'Enter',
-                        keyCode: 13,
-                        which: 13,
-                        bubbles: true,
-                        cancelable: true,
-                        ctrlKey: useModifierKey && !isMac,
-                        metaKey: useModifierKey && isMac
-                    }));
-                    setTimeout(() => (state.isSubmitting = false), 2000);
-                } catch (error) {
-                    state.isSubmitting = false;
-                }
-            },
+            deployNetworkInterceptor() { return QuerySyncModule.deployNetworkInterceptor(); },
+            deployLocalSendFallback() { return QuerySyncModule.deployLocalSendFallback(); },
+            deployAssetSyncListeners() { return AssetSyncModule.deployAssetSyncListeners(); },
+            async handleAssetFound(assets, sourceSite, targets) { return AssetSyncModule.handleAssetFound(assets, sourceSite, targets); },
+            async processSharedAsset(value) { return AssetSyncModule.processSharedAsset(value); },
+            async processAssetSubmission(site, asset) { return AssetSyncModule.processAssetSubmission(site, asset); },
+            async handleQueryFound(query, sourceSite) { return QuerySyncModule.handleQueryFound(query, sourceSite); },
+            async processSharedQuery(value) { return QuerySyncModule.processSharedQuery(value); },
+            async processSubmission(site, query) { return QuerySyncModule.processSubmission(site, query); },
             async initReceiver() {
-                const { utils, config } = AITabSync;
-                try {
-                    await utils.waitFor(() => utils.findBestInputArea(AITabSync.state.thisSite), config.TIMINGS.SUBMIT_TIMEOUT, 'UI就绪');
-                    const value = await GM_getValue(config.KEYS.SHARED_QUERY);
-                    if (value) this.processSharedQuery(value);
-                    const assetValue = await GM_getValue(config.KEYS.SHARED_ASSET);
-                    if (assetValue) this.processSharedAsset(assetValue);
-                } catch (error) { }
-                GM_addValueChangeListener(config.KEYS.SHARED_QUERY, (name, old_value, new_value, remote) => {
-                    if (remote && new_value) {
-                        try {
-                            if (JSON.parse(new_value).sourceId !== AITabSync.state.thisSite.id) this.processSharedQuery(new_value);
-                        } catch (e) { }
-                    }
-                });
-                GM_addValueChangeListener(config.KEYS.SHARED_ASSET, (name, old_value, new_value, remote) => {
-                    if (remote && new_value) {
-                        try {
-                            if (JSON.parse(new_value).sourceId !== AITabSync.state.thisSite.id) this.processSharedAsset(new_value);
-                        } catch (e) { }
-                    }
-                });
+                // 关键顺序：先挂 Query 再挂 Asset，确保文本链路优先可用。
+                await QuerySyncModule.initReceiver();
+                await AssetSyncModule.initReceiver();
             },
         },
 
         // --- 9. Main Application Logic ---
         main: {
-            async loadInitialState() {
-                const { state, config } = AITabSync;
-                state.isLoggingEnabled = await GM_getValue(config.KEYS.LOGGING_ENABLED, false);
-                state.isAssetTraceEnabled = await GM_getValue(config.KEYS.ASSET_TRACE_ENABLED, false);
-                state.visibleTargets = await GM_getValue(config.KEYS.VISIBLE_TARGETS, null);
-                if (state.visibleTargets === null) {
-                    state.visibleTargets = [...config.DISPLAY_ORDER];
-                    await GM_setValue(config.KEYS.VISIBLE_TARGETS, state.visibleTargets);
-                }
-                state.animationStyle = await GM_getValue(config.KEYS.ANIMATION_STYLE, 'spin');
-                state.isSelectionSynced = await GM_getValue(config.KEYS.SELECTION_SYNC_ENABLED, true);
-                if (state.isSelectionSynced) {
-                    const sharedSelection = await GM_getValue(config.KEYS.SHARED_SELECTION, '[]');
-                    state.selectedTargets = new Set(JSON.parse(sharedSelection));
-                }
-            },
-            registerGMListeners() {
-                const { config, ui, state, utils } = AITabSync;
-                GM_addValueChangeListener(config.KEYS.LOGGING_ENABLED, (name, ov, nv) => {
-                    state.isLoggingEnabled = nv;
-                    ui.updateMenuCommand();
-                });
-                GM_addValueChangeListener(config.KEYS.ASSET_TRACE_ENABLED, (name, ov, nv) => {
-                    state.isAssetTraceEnabled = nv;
-                    ui.updateMenuCommand();
-                });
-                GM_addValueChangeListener(config.KEYS.ACTIVE_TABS, (name, ov, nv, remote) => {
-                    if (remote) ui.updatePanelState();
-                });
-                GM_addValueChangeListener(config.KEYS.VISIBLE_TARGETS, (name, ov, nv) => {
-                    const newTargets = JSON.parse(nv || '[]');
-                    state.visibleTargets = newTargets;
-                    const oldTargets = config.DISPLAY_ORDER;
-                    oldTargets.forEach((id) => {
-                        if (!newTargets.includes(id) && state.selectedTargets.has(id)) state.selectedTargets.delete(id);
-                    });
-                    ui.rebuildChipsUI();
-                });
-                GM_addValueChangeListener(config.KEYS.SHARED_SELECTION, (name, ov, nv, remote) => {
-                    if (remote && state.isSelectionSynced) {
-                        utils.log('接收到同步的选择状态:', nv);
-                        state.selectedTargets = new Set(JSON.parse(nv || '[]'));
-                        ui.updatePanelState();
-                        ui.updateSelectAllButtonState();
-                    }
-                });
-            },
-            startBackgroundTasks() {
-                const { lifecycle, config, ui } = AITabSync;
-                lifecycle.registerTabAsActive();
-                lifecycle.cleanupStaleTabs();
-                setInterval(lifecycle.registerTabAsActive, config.TIMINGS.HEARTBEAT_INTERVAL);
-                setInterval(lifecycle.cleanupStaleTabs, config.TIMINGS.CLEANUP_INTERVAL);
-                setInterval(() => {
-                    if (document.body && !document.getElementById('ai-sync-container')) ui.createMainPanel();
-                }, 2000);
-            },
-            initEarly() {
-                AITabSync.state.thisSite = AITabSync.utils.getCurrentSiteInfo();
-                if (!AITabSync.state.thisSite) return false;
-                AITabSync.comms.deployNetworkInterceptor();
-                AITabSync.comms.deployLocalSendFallback();
-                AITabSync.comms.deployAssetSyncListeners();
-                return true;
-            },
-            async initDOMReady() {
-                const { state, ui, utils, lifecycle, comms, elements } = AITabSync;
-                if (!state.thisSite) return;
-                try {
-                    await utils.waitFor(() => document.body, 10000, 'document.body to be ready');
-                    await this.loadInitialState();
-                    utils.log(`脚本 v${AITabSync.config.SCRIPT_VERSION} 在 ${state.thisSite.name} 启动。`);
-                    ui.injectStyle();
-                    ui.createMainPanel();
-                    ui.createSettingsModal();
-                    ui.createTooltip();
-                    elements.fab.classList.add(state.animationStyle === 'spin' ? 'animation-spin' : 'animation-aurora');
-                    if (state.animationStyle === 'spin') {
-                        elements.fab.classList.add('intro-playing');
-                    }
-                    AITabSync.events.register();
-                    this.registerGMListeners();
-                    this.startBackgroundTasks();
-                    lifecycle.ensureWindowName();
-                    lifecycle.deployHistoryInterceptor();
-                    comms.initReceiver();
-                    document.addEventListener('visibilitychange', () => {
-                        if (document.visibilityState === 'visible') lifecycle.registerTabAsActive();
-                    });
-                    window.addEventListener('beforeunload', lifecycle.unregisterTabAsInactive);
-                    if (window.self === window.top) ui.updateMenuCommand();
-                } catch (error) {
-                    utils.log('初始化错误', error);
-                }
-            },
+            async loadInitialState() { return MainModule.loadInitialState(); },
+            registerGMListeners() { return MainModule.registerGMListeners(); },
+            startBackgroundTasks() { return MainModule.startBackgroundTasks(); },
+            initEarly() { return MainModule.initEarly(); },
+            async initDOMReady() { return MainModule.initDOMReady(); },
         },
     };
 
-    if (AITabSync.main.initEarly()) {
-        if (document.readyState === 'loading') {
-            document.addEventListener('DOMContentLoaded', () => AITabSync.main.initDOMReady());
-        } else {
-            AITabSync.main.initDOMReady();
-        }
-    }
+    // =========================
+    // 单文件 IIFE 伪模块化层（方案B）
+    // =========================
+    // 模块关系：Core(状态/配置) -> Infra(外部能力) -> Lifecycle/Query/Asset/Main(业务域) -> App(启动入口)
+    // 公共 API 清单：
+    // - Stability: runStartupSanityChecks
+    // - Lifecycle: ensureWindowName / deployHistoryInterceptor / registerTabAsActive / unregisterTabAsInactive / cleanupStaleTabs
+    // - Events: register / onChipClick / onSelectAllClick / onSettingsChange / onAnimationToggleChange / onSelectionSyncToggleChange
+    // - QuerySync: deployNetworkInterceptor / deployLocalSendFallback / handleQueryFound / processSharedQuery / processSubmission / initReceiver
+    // - AssetSync: deployAssetSyncListeners / handleAssetFound / processSharedAsset / processAssetSubmission / initReceiver
+    // - Main: loadInitialState / registerGMListeners / startBackgroundTasks / initEarly / initDOMReady
+
+    // 关键注释：Core 只暴露状态与配置访问，不承载业务副作用。
+    const CoreModule = (() => ({
+        get state() { return AITabSync.state; },
+        get config() { return AITabSync.config; },
+        get elements() { return AITabSync.elements; },
+        get utils() { return AITabSync.utils; },
+    }))();
+
+    // 关键注释：Infra 统一包装外部能力（GM API + 日志），业务模块避免直接触碰全局 API。
+    const InfraModule = ((core) => ({
+        storage: {
+            get: (key, fallback) => GM_getValue(key, fallback),
+            set: (key, value) => GM_setValue(key, value),
+            del: (key) => GM_deleteValue(key),
+            listen: (key, callback) => GM_addValueChangeListener(key, callback),
+        },
+        log: (...args) => core.utils.log(...args),
+        assetTrace: (...args) => core.utils.assetTrace(...args),
+    }))(CoreModule);
+
+    // 关键注释：Stability 仅做“轻量启动自检”，不参与业务链路。
+    const StabilityModule = ((core, infra) => {
+        const requiredConfigPaths = [
+            ['KEYS', 'SHARED_QUERY'],
+            ['KEYS', 'SHARED_ASSET'],
+            ['KEYS', 'ACTIVE_TABS'],
+            ['TIMINGS', 'SUBMIT_TIMEOUT'],
+            ['TIMINGS', 'HEARTBEAT_INTERVAL'],
+            ['SITES'],
+        ];
+
+        const requiredUtils = [
+            'getCurrentSiteInfo',
+            'waitFor',
+            'findBestInputArea',
+            'simulateInput',
+            'fileToDataUrl',
+            'createFileFromAsset',
+        ];
+
+        const hasPath = (obj, path) => {
+            let current = obj;
+            for (const key of path) {
+                if (!current || !(key in current)) return false;
+                current = current[key];
+            }
+            return true;
+        };
+
+        const collectIssues = () => {
+            const issues = [];
+
+            if (!core?.state || !core?.config || !core?.utils || !core?.elements) {
+                issues.push('CoreModule 暴露对象不完整');
+            }
+
+            if (!infra?.storage || typeof infra.storage.get !== 'function' || typeof infra.storage.set !== 'function') {
+                issues.push('InfraModule.storage 不可用');
+            }
+
+            for (const path of requiredConfigPaths) {
+                if (!hasPath(core.config, path)) {
+                    issues.push(`缺失配置项: config.${path.join('.')}`);
+                }
+            }
+
+            for (const methodName of requiredUtils) {
+                if (typeof core.utils?.[methodName] !== 'function') {
+                    issues.push(`缺失工具函数: utils.${methodName}`);
+                }
+            }
+
+            return issues;
+        };
+
+        const runStartupSanityChecks = (stage = 'startup', options = {}) => {
+            const strictMode = options.strictMode === true;
+            const issues = collectIssues();
+            if (issues.length === 0) {
+                infra.log(`[Stability] ${stage} 自检通过`);
+                return true;
+            }
+
+            const summary = `[AI Sync][Stability] ${stage} 自检失败，共 ${issues.length} 项`;
+            if (typeof console !== 'undefined') {
+                console.warn(summary, issues);
+                if (strictMode) {
+                    console.error('[AI Sync][StrictMode] 详细自检错误', {
+                        stage,
+                        issues,
+                        state: {
+                            thisSite: core.state?.thisSite?.id || null,
+                            isStrictModeEnabled: core.state?.isStrictModeEnabled,
+                        },
+                    });
+                }
+            }
+            infra.log(summary, issues);
+
+            if (strictMode) {
+                throw new Error(`[AI Sync][StrictMode] ${stage} 自检失败，请查看控制台详细错误`);
+            }
+            return false;
+        };
+
+        return {
+            runStartupSanityChecks,
+        };
+    })(CoreModule, InfraModule);
+
+    // 关键注释：Lifecycle 负责“标签生命周期与心跳”，不处理业务协议。
+    const LifecycleModule = ((core, infra) => {
+        const ensureWindowName = () => {
+            const { thisSite } = core.state;
+            if (!thisSite) return;
+            const expectedName = `ai_sync_window_for_${thisSite.id}`;
+            if (window.name !== expectedName) window.name = expectedName;
+        };
+
+        const registerTabAsActive = async () => {
+            const { thisSite } = core.state;
+            if (!thisSite) return;
+            try {
+                const activeTabs = JSON.parse(await infra.storage.get(core.config.KEYS.ACTIVE_TABS, '{}'));
+                activeTabs[thisSite.id] = { url: window.location.href, timestamp: Date.now() };
+                await infra.storage.set(core.config.KEYS.ACTIVE_TABS, JSON.stringify(activeTabs));
+            } catch (e) {
+                infra.log('心跳注册失败:', e);
+            }
+        };
+
+        const unregisterTabAsInactive = async () => {
+            const { thisSite } = core.state;
+            if (!thisSite) return;
+            try {
+                const key = core.config.KEYS.ACTIVE_TABS;
+                const activeTabs = JSON.parse(await infra.storage.get(key, '{}'));
+                if (activeTabs[thisSite.id]) {
+                    delete activeTabs[thisSite.id];
+                    await infra.storage.set(key, JSON.stringify(activeTabs));
+                }
+            } catch (e) { }
+        };
+
+        const cleanupStaleTabs = async () => {
+            try {
+                const activeTabs = JSON.parse(await infra.storage.get(core.config.KEYS.ACTIVE_TABS, '{}'));
+                const now = Date.now();
+                let hasChanged = false;
+                for (const siteId in activeTabs) {
+                    if (Object.prototype.hasOwnProperty.call(activeTabs, siteId)) {
+                        const tabInfo = activeTabs[siteId];
+                        if (typeof tabInfo !== 'object' || tabInfo === null || now - tabInfo.timestamp > core.config.TIMINGS.STALE_THRESHOLD) {
+                            delete activeTabs[siteId];
+                            hasChanged = true;
+                        }
+                    }
+                }
+                if (hasChanged) await infra.storage.set(core.config.KEYS.ACTIVE_TABS, JSON.stringify(activeTabs));
+            } catch (e) { }
+        };
+
+        const deployHistoryInterceptor = () => {
+            const { thisSite } = core.state;
+            if (!thisSite) return;
+            const originalPushState = history.pushState;
+            const originalReplaceState = history.replaceState;
+            let lastUrl = location.href;
+            const handleUrlChange = () => {
+                setTimeout(() => {
+                    if (location.href !== lastUrl) {
+                        lastUrl = location.href;
+                        ensureWindowName();
+                        registerTabAsActive();
+                    }
+                }, 100);
+            };
+            history.pushState = function (...args) {
+                originalPushState.apply(this, args);
+                handleUrlChange();
+            };
+            history.replaceState = function (...args) {
+                originalReplaceState.apply(this, args);
+                handleUrlChange();
+            };
+            window.addEventListener('popstate', handleUrlChange);
+        };
+
+        return {
+            ensureWindowName,
+            deployHistoryInterceptor,
+            registerTabAsActive,
+            unregisterTabAsInactive,
+            cleanupStaleTabs,
+        };
+    })(CoreModule, InfraModule);
+
+    // 关键注释：Main 只做启动编排；协议细节下沉到 Query/Asset/Lifecycle 模块。
+    const MainModule = ((core, infra) => {
+        const loadInitialState = async () => {
+            const { state, config } = AITabSync;
+            state.isLoggingEnabled = await infra.storage.get(config.KEYS.LOGGING_ENABLED, false);
+            state.isAssetTraceEnabled = await infra.storage.get(config.KEYS.ASSET_TRACE_ENABLED, false);
+            state.visibleTargets = await infra.storage.get(config.KEYS.VISIBLE_TARGETS, null);
+            if (state.visibleTargets === null) {
+                state.visibleTargets = [...config.DISPLAY_ORDER];
+                await infra.storage.set(config.KEYS.VISIBLE_TARGETS, state.visibleTargets);
+            }
+            state.animationStyle = await infra.storage.get(config.KEYS.ANIMATION_STYLE, 'spin');
+            state.isSelectionSynced = await infra.storage.get(config.KEYS.SELECTION_SYNC_ENABLED, true);
+            state.isStrictModeEnabled = await infra.storage.get(config.KEYS.STRICT_MODE_ENABLED, false);
+            if (state.isSelectionSynced) {
+                const sharedSelection = await infra.storage.get(config.KEYS.SHARED_SELECTION, '[]');
+                state.selectedTargets = new Set(JSON.parse(sharedSelection));
+            }
+        };
+
+        const registerGMListeners = () => {
+            const { config, ui, state, utils } = AITabSync;
+            infra.storage.listen(config.KEYS.LOGGING_ENABLED, (name, ov, nv) => {
+                state.isLoggingEnabled = nv;
+                ui.updateMenuCommand();
+            });
+            infra.storage.listen(config.KEYS.ASSET_TRACE_ENABLED, (name, ov, nv) => {
+                state.isAssetTraceEnabled = nv;
+                ui.updateMenuCommand();
+            });
+            infra.storage.listen(config.KEYS.ACTIVE_TABS, (name, ov, nv, remote) => {
+                if (remote) ui.updatePanelState();
+            });
+            infra.storage.listen(config.KEYS.VISIBLE_TARGETS, (name, ov, nv) => {
+                const newTargets = JSON.parse(nv || '[]');
+                state.visibleTargets = newTargets;
+                const oldTargets = config.DISPLAY_ORDER;
+                oldTargets.forEach((id) => {
+                    if (!newTargets.includes(id) && state.selectedTargets.has(id)) state.selectedTargets.delete(id);
+                });
+                ui.rebuildChipsUI();
+            });
+            infra.storage.listen(config.KEYS.SHARED_SELECTION, (name, ov, nv, remote) => {
+                if (remote && state.isSelectionSynced) {
+                    utils.log('接收到同步的选择状态:', nv);
+                    state.selectedTargets = new Set(JSON.parse(nv || '[]'));
+                    ui.updatePanelState();
+                    ui.updateSelectAllButtonState();
+                }
+            });
+            infra.storage.listen(config.KEYS.STRICT_MODE_ENABLED, (name, ov, nv) => {
+                state.isStrictModeEnabled = !!nv;
+                ui.updateMenuCommand();
+            });
+        };
+
+        const startBackgroundTasks = () => {
+            const { config, ui } = AITabSync;
+            LifecycleModule.registerTabAsActive();
+            LifecycleModule.cleanupStaleTabs();
+            setInterval(() => LifecycleModule.registerTabAsActive(), config.TIMINGS.HEARTBEAT_INTERVAL);
+            setInterval(() => LifecycleModule.cleanupStaleTabs(), config.TIMINGS.CLEANUP_INTERVAL);
+            setInterval(() => {
+                if (document.body && !document.getElementById('ai-sync-container')) ui.createMainPanel();
+            }, 2000);
+        };
+
+        const initEarly = () => {
+            core.state.thisSite = core.utils.getCurrentSiteInfo();
+            if (!core.state.thisSite) return false;
+            AITabSync.comms.deployNetworkInterceptor();
+            AITabSync.comms.deployLocalSendFallback();
+            AITabSync.comms.deployAssetSyncListeners();
+            return true;
+        };
+
+        const initDOMReady = async () => {
+            const { state, ui, utils, comms, elements } = AITabSync;
+            if (!state.thisSite) return;
+            try {
+                await utils.waitFor(() => document.body, 10000, 'document.body to be ready');
+                await loadInitialState();
+                // 关键注释：加载完用户偏好后再执行严格模式断言，确保开关即时生效。
+                if (!StabilityModule.runStartupSanityChecks('post-load', { strictMode: state.isStrictModeEnabled })) return;
+                utils.log(`脚本 v${AITabSync.config.SCRIPT_VERSION} 在 ${state.thisSite.name} 启动。`);
+                ui.injectStyle();
+                ui.createMainPanel();
+                ui.createSettingsModal();
+                ui.createTooltip();
+                elements.fab.classList.add(state.animationStyle === 'spin' ? 'animation-spin' : 'animation-aurora');
+                if (state.animationStyle === 'spin') {
+                    elements.fab.classList.add('intro-playing');
+                }
+                AITabSync.events.register();
+                registerGMListeners();
+                startBackgroundTasks();
+                LifecycleModule.ensureWindowName();
+                LifecycleModule.deployHistoryInterceptor();
+                comms.initReceiver();
+                document.addEventListener('visibilitychange', () => {
+                    if (document.visibilityState === 'visible') LifecycleModule.registerTabAsActive();
+                });
+                window.addEventListener('beforeunload', () => LifecycleModule.unregisterTabAsInactive());
+                if (window.self === window.top) ui.updateMenuCommand();
+            } catch (error) {
+                utils.log('初始化错误', error);
+            }
+        };
+
+        return {
+            loadInitialState,
+            registerGMListeners,
+            startBackgroundTasks,
+            initEarly,
+            initDOMReady,
+        };
+    })(CoreModule, InfraModule);
+
+    // 关键注释：Events 统一管理 UI 交互事件，避免事件逻辑散落在 ui/main 中。
+    const EventsModule = ((core, infra) => {
+        const register = () => {
+            const { elements, ui } = AITabSync;
+            elements.fab.addEventListener('click', (e) => {
+                e.stopPropagation();
+                ui.togglePanelVisibility();
+            });
+            elements.container.addEventListener('click', onChipClick);
+            elements.container.querySelector('#ai-sync-select-all-btn').addEventListener('click', onSelectAllClick);
+            elements.container.querySelector('#ai-sync-settings-btn').addEventListener('click', () => {
+                if (elements.settingsModal) elements.settingsModal.style.display = 'flex';
+            });
+            elements.settingsModal.addEventListener('click', (e) => {
+                if (e.target === elements.settingsModal) elements.settingsModal.style.display = 'none';
+            });
+            elements.settingsModal.querySelector('.ai-sync-settings-list').addEventListener('change', onSettingsChange);
+            elements.settingsModal.querySelector('#ai-sync-animation-toggle').addEventListener('change', onAnimationToggleChange);
+            elements.settingsModal.querySelector('#ai-sync-selection-sync-toggle').addEventListener('change', onSelectionSyncToggleChange);
+            elements.container.addEventListener('mouseover', onChipMouseOver, true);
+            elements.container.addEventListener('mouseout', onChipMouseOut, true);
+        };
+
+        const onChipClick = async (event) => {
+            if (event.target.matches('.ai-sync-chip')) {
+                const { config, state, ui, utils } = AITabSync;
+                const chip = event.target;
+                const siteId = chip.dataset.siteId;
+                const siteInfo = config.SITES[siteId];
+                if (!siteInfo) return;
+                if (state.selectedTargets.has(siteId)) {
+                    state.selectedTargets.delete(siteId);
+                    if (state.isSelectionSynced && state.selectedTargets.size === 1 && state.selectedTargets.has(state.thisSite.id)) {
+                        state.selectedTargets.clear();
+                    }
+                } else {
+                    state.selectedTargets.add(siteId);
+                    if (state.isSelectionSynced) {
+                        state.selectedTargets.add(state.thisSite.id);
+                    }
+                    const activeTabs = JSON.parse(await infra.storage.get(config.KEYS.ACTIVE_TABS, '{}'));
+                    if (!activeTabs[siteId]) {
+                        utils.log(`打开新标签页: ${siteId}`);
+                        window.open(siteInfo.url, `ai_sync_window_for_${siteId}`);
+                    }
+                }
+                ui.updatePanelState();
+                ui.updateSelectAllButtonState();
+                if (state.isSelectionSynced) {
+                    await infra.storage.set(config.KEYS.SHARED_SELECTION, JSON.stringify(Array.from(state.selectedTargets)));
+                }
+            } else if (event.target === AITabSync.elements.container) {
+                AITabSync.ui.togglePanelVisibility();
+            }
+        };
+
+        const onSelectAllClick = async () => {
+            const { config, state, ui, utils } = AITabSync;
+            const visibleTargets = config.DISPLAY_ORDER.filter(id => state.visibleTargets.includes(id) && id !== state.thisSite.id);
+            const allSelected = visibleTargets.length > 0 && visibleTargets.every(id => state.selectedTargets.has(id));
+            if (allSelected) {
+                state.selectedTargets.clear();
+            } else {
+                const activeTabs = JSON.parse(await infra.storage.get(config.KEYS.ACTIVE_TABS, '{}'));
+                visibleTargets.forEach(siteId => {
+                    state.selectedTargets.add(siteId);
+                    const siteInfo = config.SITES[siteId];
+                    if (!activeTabs[siteId] && siteInfo) {
+                        utils.log(`(全选) 打开新标签页: ${siteId}`);
+                        window.open(siteInfo.url, `ai_sync_window_for_${siteId}`);
+                    }
+                });
+                if (state.isSelectionSynced) {
+                    state.selectedTargets.add(state.thisSite.id);
+                }
+            }
+            ui.updatePanelState();
+            ui.updateSelectAllButtonState();
+            if (state.isSelectionSynced) {
+                await infra.storage.set(config.KEYS.SHARED_SELECTION, JSON.stringify(Array.from(state.selectedTargets)));
+            }
+        };
+
+        const onSettingsChange = async (event) => {
+            if (event.target.type !== 'checkbox') return;
+            const { config, state, ui } = AITabSync;
+            const list = event.currentTarget;
+            const checkboxes = list.querySelectorAll('input[type="checkbox"]:checked');
+            const newVisibleTargets = Array.from(checkboxes).map((cb) => cb.value);
+            await infra.storage.set(config.KEYS.VISIBLE_TARGETS, newVisibleTargets);
+            state.visibleTargets = newVisibleTargets;
+            const oldTargets = config.DISPLAY_ORDER;
+            oldTargets.forEach((id) => {
+                if (!newVisibleTargets.includes(id) && state.selectedTargets.has(id)) state.selectedTargets.delete(id);
+            });
+            ui.rebuildChipsUI();
+        };
+
+        const onAnimationToggleChange = async (event) => {
+            const { state, config, elements, utils } = AITabSync;
+            const isSpinEnabled = event.target.checked;
+            const newStyle = isSpinEnabled ? 'spin' : 'aurora';
+            if (state.animationStyle === newStyle) return;
+            await infra.storage.set(config.KEYS.ANIMATION_STYLE, newStyle);
+            state.animationStyle = newStyle;
+            utils.log(`动画样式已切换为: ${newStyle}`);
+            elements.fab.classList.remove('animation-aurora', 'animation-spin', 'intro-playing');
+            elements.fab.classList.add(isSpinEnabled ? 'animation-spin' : 'animation-aurora');
+            if (isSpinEnabled) elements.fab.classList.add('intro-playing');
+        };
+
+        const onSelectionSyncToggleChange = async (event) => {
+            const { state, config, utils } = AITabSync;
+            const isEnabled = event.target.checked;
+            state.isSelectionSynced = isEnabled;
+            await infra.storage.set(config.KEYS.SELECTION_SYNC_ENABLED, isEnabled);
+            utils.log(`选择状态同步已 ${isEnabled ? '开启' : '关闭'}.`);
+            if (!isEnabled) {
+                infra.storage.del(config.KEYS.SHARED_SELECTION);
+            }
+        };
+
+        const onClickOutside = (event) => {
+            const { container } = AITabSync.elements;
+            if (container && !container.contains(event.target) && container.classList.contains('expanded')) {
+                AITabSync.ui.togglePanelVisibility();
+            }
+        };
+
+        const onChipMouseOver = (event) => {
+            if (!event.target.matches('.ai-sync-chip')) return;
+            const { state, config, elements } = AITabSync;
+            const chip = event.target;
+            const siteId = chip.dataset.siteId;
+            const tooltipText = state.selectedTargets.has(siteId) ? '已选中 (点击取消)' : (chip.classList.contains('online') ? '待发送 (点击选中)' : '点击启动');
+            state.tooltipTimeoutId = setTimeout(() => {
+                elements.tooltip.textContent = tooltipText;
+                const chipRect = chip.getBoundingClientRect();
+                elements.tooltip.style.left = `${chipRect.left + chipRect.width / 2}px`;
+                elements.tooltip.style.top = `${chipRect.top}px`;
+                elements.tooltip.style.display = 'block';
+            }, config.TIMINGS.TOOLTIP_DELAY);
+        };
+
+        const onChipMouseOut = (event) => {
+            if (!event.target.matches('.ai-sync-chip')) return;
+            clearTimeout(AITabSync.state.tooltipTimeoutId);
+            AITabSync.elements.tooltip.style.display = 'none';
+        };
+
+        const onToggleLogging = async () => {
+            const { state, ui } = AITabSync;
+            state.isLoggingEnabled = !state.isLoggingEnabled;
+            await infra.storage.set(AITabSync.config.KEYS.LOGGING_ENABLED, state.isLoggingEnabled);
+            alert(`[AI Sync] 调试日志 ${state.isLoggingEnabled ? '已开启' : '已关闭'}。`);
+            ui.updateMenuCommand();
+        };
+
+        const onToggleAssetTrace = async () => {
+            const { state, ui } = AITabSync;
+            state.isAssetTraceEnabled = !state.isAssetTraceEnabled;
+            await infra.storage.set(AITabSync.config.KEYS.ASSET_TRACE_ENABLED, state.isAssetTraceEnabled);
+            alert(`[AI Sync] 资产链路日志 ${state.isAssetTraceEnabled ? '已开启' : '已关闭'}。`);
+            ui.updateMenuCommand();
+        };
+
+        const onToggleStrictMode = async () => {
+            const { state, ui, config } = AITabSync;
+            state.isStrictModeEnabled = !state.isStrictModeEnabled;
+            await infra.storage.set(config.KEYS.STRICT_MODE_ENABLED, state.isStrictModeEnabled);
+            alert(`[AI Sync] 严格模式 ${state.isStrictModeEnabled ? '已开启' : '已关闭'}。`);
+            ui.updateMenuCommand();
+        };
+
+        return {
+            register,
+            onChipClick,
+            onSelectAllClick,
+            onSettingsChange,
+            onAnimationToggleChange,
+            onSelectionSyncToggleChange,
+            onClickOutside,
+            onChipMouseOver,
+            onChipMouseOut,
+            onToggleLogging,
+            onToggleAssetTrace,
+            onToggleStrictMode,
+        };
+    })(CoreModule, InfraModule);
+
+    const QuerySyncModule = ((core, infra) => {
+        const deployNetworkInterceptor = () => {
+            const { thisSite } = core.state;
+            if (!thisSite?.queryExtractor) return;
+            const { send } = unsafeWindow.XMLHttpRequest.prototype;
+            if (!send._isHooked) {
+                const { open } = unsafeWindow.XMLHttpRequest.prototype;
+                unsafeWindow.XMLHttpRequest.prototype.open = function (method, url, ...args) {
+                    this._url = url;
+                    return open.apply(this, [method, url, ...args]);
+                };
+                unsafeWindow.XMLHttpRequest.prototype.send = function (body) {
+                    const site = core.utils.getCurrentSiteInfo();
+                    if (site?.apiPaths.some((p) => this._url?.includes(p)) && body && !core.state.isSubmitting) {
+                        try {
+                            const bodyType = core.utils.getBodyType(body);
+                            const bodyText = typeof body === 'string'
+                                ? body
+                                : (typeof URLSearchParams !== 'undefined' && body instanceof URLSearchParams ? body.toString() : '');
+                            infra.log(`拦截到 ${site.id} XHR 请求`, {
+                                url: this._url,
+                                bodyType,
+                                preview: bodyText.slice(0, 200)
+                            });
+                            if (bodyText) {
+                                const query = site.queryExtractor(bodyText);
+                                if (query) {
+                                    infra.log(`从 ${site.id} XHR 请求提取到问题`, query);
+                                    handleQueryFound(query, site);
+                                } else {
+                                    infra.log(`命中 ${site.id} XHR 请求，但未提取到问题`, {
+                                        url: this._url,
+                                        bodyType,
+                                        preview: bodyText.slice(0, 200)
+                                    });
+                                }
+                            } else {
+                                infra.log(`命中 ${site.id} XHR 请求，但请求体类型暂不支持读取`, {
+                                    url: this._url,
+                                    bodyType
+                                });
+                            }
+                        } catch (e) {
+                            infra.log(`解析 ${site.id} XHR 请求失败`, e);
+                        }
+                    }
+                    return send.apply(this, arguments);
+                };
+                unsafeWindow.XMLHttpRequest.prototype.send._isHooked = true;
+            }
+            const { fetch } = unsafeWindow;
+            if (!fetch._isHooked) {
+                unsafeWindow.fetch = async function (...args) {
+                    const site = core.utils.getCurrentSiteInfo();
+                    const request = args[0] instanceof Request ? args[0] : null;
+                    const url = request ? request.url : String(args[0] || '');
+                    const config = args[1] || {};
+                    const method = (config.method || request?.method || 'GET').toUpperCase();
+                    if (site?.apiPaths.some((p) => url.includes(p)) && method === 'POST' && !core.state.isSubmitting) {
+                        try {
+                            const bodySource = config.body !== undefined
+                                ? config.body
+                                : (request ? request.clone() : null);
+                            const bodyType = core.utils.getBodyType(bodySource);
+                            const bodyText = await core.utils.bodyToText(bodySource);
+                            infra.log(`拦截到 ${site.id} fetch 请求`, {
+                                url,
+                                method,
+                                bodyType,
+                                preview: bodyText.slice(0, 200)
+                            });
+                            if (bodyText) {
+                                const query = site.queryExtractor(bodyText);
+                                if (query) {
+                                    infra.log(`从 ${site.id} fetch 请求提取到问题`, query);
+                                    handleQueryFound(query, site);
+                                } else {
+                                    infra.log(`命中 ${site.id} fetch 请求，但未提取到问题`, {
+                                        url,
+                                        method,
+                                        bodyType,
+                                        preview: bodyText.slice(0, 200)
+                                    });
+                                }
+                            } else {
+                                infra.log(`命中 ${site.id} fetch 请求，但请求体为空或无法读取`, {
+                                    url,
+                                    method,
+                                    bodyType
+                                });
+                            }
+                        } catch (e) {
+                            infra.log(`解析 ${site?.id || 'UNKNOWN'} fetch 请求失败`, e);
+                        }
+                    }
+                    return fetch.apply(this, args);
+                };
+                unsafeWindow.fetch._isHooked = true;
+            }
+        };
+
+        const deployLocalSendFallback = () => {
+            const { utils, state } = AITabSync;
+            const shouldSkipBecauseSuppressed = () => Date.now() < state.suppressNextLocalSendCaptureUntil;
+
+            const readInputContent = (inputArea) => {
+                if (!inputArea) return '';
+                if (inputArea.tagName === 'TEXTAREA') return (inputArea.value || '').trim();
+                return (inputArea.textContent || '').trim();
+            };
+
+            const canTreatAsInputArea = (element) => {
+                if (!element) return false;
+                if (element.tagName === 'TEXTAREA') return true;
+                if (element.isContentEditable || element.getAttribute('contenteditable') === 'true') return true;
+                return false;
+            };
+
+            const broadcastIfValid = (query) => {
+                const q = String(query || '').trim();
+                if (!q || shouldSkipBecauseSuppressed()) return;
+                handleQueryFound(q, state.thisSite);
+            };
+
+            document.addEventListener('keydown', (event) => {
+                if (!event.isTrusted || state.isSubmitting || shouldSkipBecauseSuppressed()) return;
+                const target = event.target;
+                if (!(target instanceof Element) || !canTreatAsInputArea(target)) return;
+                const isEnter = event.key === 'Enter';
+                if (!isEnter || event.shiftKey || event.altKey) return;
+
+                const isModifierSend = event.ctrlKey || event.metaKey;
+                const siteId = state.thisSite?.id;
+                const isStudio = siteId === 'AI_STUDIO';
+                if (isStudio && !isModifierSend) return;
+
+                const query = readInputContent(target);
+                if (!query) return;
+                setTimeout(() => broadcastIfValid(query), 0);
+            }, true);
+
+            document.addEventListener('click', (event) => {
+                if (!event.isTrusted || state.isSubmitting || shouldSkipBecauseSuppressed()) return;
+                const target = event.target;
+                if (!(target instanceof Element)) return;
+                const clickable = target.closest('button,[role="button"],[aria-label*="发送"],[aria-label*="Send"],[data-testid*="send"],.send-button');
+                if (!clickable) return;
+
+                const inputArea = utils.findBestInputArea(state.thisSite);
+                const query = readInputContent(inputArea);
+                if (!query) return;
+
+                setTimeout(() => {
+                    const latestInput = utils.findBestInputArea(state.thisSite);
+                    const latestContent = readInputContent(latestInput);
+                    if (!latestContent) broadcastIfValid(query);
+                }, 120);
+            }, true);
+        };
+
+        const handleQueryFound = async (query, sourceSite) => {
+            const { utils, state, config, elements } = AITabSync;
+            const targets = Array.from(state.selectedTargets);
+            if (targets.length === 0) return;
+            utils.log(`准备从 ${sourceSite.id} 广播问题`, {
+                targets,
+                preview: query.slice(0, 120)
+            });
+            if (elements.fab) {
+                elements.fab.classList.add('sending');
+                setTimeout(() => elements.fab?.classList.remove('sending'), 2000);
+            }
+            await infra.storage.set(config.KEYS.SHARED_QUERY, JSON.stringify({
+                query,
+                timestamp: Date.now(),
+                sourceId: sourceSite.id,
+                targetIds: targets
+            }));
+        };
+
+        const processSubmission = async (site, query) => {
+            const { utils, config, state } = AITabSync;
+            const inputArea = await utils.waitFor(() => utils.findBestInputArea(site), config.TIMINGS.SUBMIT_TIMEOUT, '输入框');
+            utils.log(`开始向 ${site.id} 注入问题`, {
+                input: utils.getElementDescriptor(inputArea),
+                preview: query.slice(0, 120)
+            });
+            utils.simulateInput(inputArea, query);
+            // 关键注释：抑制窗口用于阻断“远端注入后被本地再次捕获”导致的回环广播。
+            state.suppressNextLocalSendCaptureUntil = Date.now() + 3000;
+            await new Promise((resolve) => setTimeout(resolve, config.TIMINGS.HUMAN_LIKE_DELAY));
+            try {
+                state.isSubmitting = true;
+                if (site.id === 'QWEN') {
+                    const sendButton = document.querySelector('div.omni-button-content button.ant-btn-primary')
+                        || document.querySelector('div.omni-button-content button');
+                    if (sendButton && !sendButton.disabled && !sendButton.classList.contains('disabled')) {
+                        sendButton.click();
+                        setTimeout(() => (state.isSubmitting = false), 2000);
+                        return;
+                    }
+                }
+                if (site.id === 'AI_STUDIO') {
+                    const sendButton = utils.deepQuerySelector('run-button button[aria-label="Run"]')
+                        || utils.deepQuerySelector('button[aria-label="Run"]')
+                        || utils.deepQuerySelector('button[aria-label="Submit"]');
+                    if (sendButton && !sendButton.disabled) {
+                        sendButton.click();
+                        setTimeout(() => (state.isSubmitting = false), 2000);
+                        return;
+                    }
+                }
+                const isMac = navigator.platform.toUpperCase().indexOf('MAC') >= 0;
+                const useModifierKey = site.id === 'AI_STUDIO';
+                inputArea.dispatchEvent(new KeyboardEvent('keydown', {
+                    key: 'Enter',
+                    code: 'Enter',
+                    keyCode: 13,
+                    which: 13,
+                    bubbles: true,
+                    cancelable: true,
+                    ctrlKey: useModifierKey && !isMac,
+                    metaKey: useModifierKey && isMac
+                }));
+                setTimeout(() => (state.isSubmitting = false), 2000);
+            } catch (error) {
+                state.isSubmitting = false;
+            }
+        };
+
+        const processSharedQuery = async (value) => {
+            const { state, utils, config } = AITabSync;
+            if (state.isProcessingQueryTask || !value) return;
+            state.isProcessingQueryTask = true;
+            try {
+                const data = JSON.parse(value);
+                utils.log(`收到共享问题，当前站点 ${state.thisSite.id}`, {
+                    sourceId: data.sourceId,
+                    targetIds: data.targetIds,
+                    ageMs: Date.now() - data.timestamp,
+                    preview: String(data.query || '').slice(0, 120)
+                });
+                if (!data.targetIds?.includes(state.thisSite.id) || Date.now() - data.timestamp >= config.TIMINGS.FRESHNESS_THRESHOLD) {
+                    utils.log(`跳过共享问题，当前站点 ${state.thisSite.id} 不在目标列表或消息已过期`);
+                    return;
+                }
+                const remainingTargets = data.targetIds.filter((id) => id !== state.thisSite.id);
+                if (remainingTargets.length > 0) {
+                    await infra.storage.set(config.KEYS.SHARED_QUERY, JSON.stringify({ ...data, targetIds: remainingTargets }));
+                } else {
+                    await infra.storage.del(config.KEYS.SHARED_QUERY);
+                }
+                await processSubmission(state.thisSite, data.query);
+            } catch (e) {
+                await infra.storage.del(config.KEYS.SHARED_QUERY);
+            } finally {
+                state.isProcessingQueryTask = false;
+            }
+        };
+
+        const initReceiver = async () => {
+            const { utils, config } = AITabSync;
+            try {
+                await utils.waitFor(() => utils.findBestInputArea(AITabSync.state.thisSite), config.TIMINGS.SUBMIT_TIMEOUT, 'UI就绪');
+                const value = await infra.storage.get(config.KEYS.SHARED_QUERY);
+                if (value) processSharedQuery(value);
+            } catch (error) { }
+
+            infra.storage.listen(config.KEYS.SHARED_QUERY, (name, old_value, new_value, remote) => {
+                if (remote && new_value) {
+                    try {
+                        if (JSON.parse(new_value).sourceId !== AITabSync.state.thisSite.id) processSharedQuery(new_value);
+                    } catch (e) { }
+                }
+            });
+        };
+
+        return {
+            deployNetworkInterceptor,
+            deployLocalSendFallback,
+            handleQueryFound,
+            processSharedQuery,
+            processSubmission,
+            initReceiver,
+        };
+    })(CoreModule, InfraModule);
+
+    const AssetSyncModule = ((core, infra) => {
+        const deployAssetSyncListeners = () => {
+            const { utils, state } = AITabSync;
+            const isSuppressed = () => Date.now() < state.suppressLocalAssetCaptureUntil;
+
+            const broadcastFiles = async (files, origin) => {
+                const sourceSite = state.thisSite;
+                const targets = Array.from(state.selectedTargets);
+                if (!sourceSite || targets.length === 0 || !files?.length || isSuppressed()) return;
+
+                const fileList = Array.from(files).filter(Boolean);
+                if (fileList.length === 0) return;
+
+                utils.assetTrace('捕获本地资产事件', {
+                    origin,
+                    site: sourceSite.id,
+                    targets,
+                    fileCount: fileList.length,
+                    files: fileList.slice(0, 5).map((file) => ({
+                        name: file.name,
+                        type: file.type,
+                        size: file.size,
+                        lastModified: file.lastModified,
+                    })),
+                });
+
+                try {
+                    const assetsToBroadcast = [];
+                    for (const file of fileList) {
+                        const dataUrl = await utils.fileToDataUrl(file);
+                        utils.gcMapByAge(state.recentAssetFingerprints, AITabSync.config.TIMINGS.ASSET_DEDUP_WINDOW);
+                        const fingerprint = utils.makeDataUrlFingerprint(dataUrl);
+                        const lastSeen = state.recentAssetFingerprints.get(fingerprint) || 0;
+                        // 关键注释：内容指纹窗口去重，防止同一资产在 paste/change 链路重复广播。
+                        if (Date.now() - lastSeen < AITabSync.config.TIMINGS.ASSET_DEDUP_WINDOW) {
+                            utils.log('跳过重复资产广播（命中内容去重窗口）', { origin, fingerprint, name: file.name });
+                            utils.assetTrace('命中内容去重，跳过广播', {
+                                origin,
+                                fingerprint,
+                                name: file.name,
+                                ageMs: Date.now() - lastSeen
+                            });
+                            continue;
+                        }
+                        state.recentAssetFingerprints.set(fingerprint, Date.now());
+                        assetsToBroadcast.push({
+                            name: file.name,
+                            mimeType: file.type || 'application/octet-stream',
+                            size: file.size || 0,
+                            dataUrl,
+                            origin,
+                        });
+                    }
+
+                    if (assetsToBroadcast.length === 0) return;
+
+                    utils.assetTrace('通过内容去重检查，准备广播', {
+                        origin,
+                        count: assetsToBroadcast.length,
+                    });
+
+                    await handleAssetFound(assetsToBroadcast, sourceSite, targets);
+                } catch (error) {
+                    utils.log('资产同步读取失败', error);
+                }
+            };
+
+            document.addEventListener('paste', (event) => {
+                if (!event.isTrusted || state.isApplyingRemoteAsset || isSuppressed()) return;
+                utils.assetTrace('监听到 paste 事件');
+                const items = event.clipboardData?.items;
+                if (!items?.length) return;
+                const files = [];
+                for (let i = 0; i < items.length; i++) {
+                    const item = items[i];
+                    if (item.kind === 'file') {
+                        const file = item.getAsFile();
+                        if (file) files.push(file);
+                    }
+                }
+                if (files.length > 0) broadcastFiles(files, 'paste');
+            }, true);
+
+            document.addEventListener('drop', (event) => {
+                if (!event.isTrusted || state.isApplyingRemoteAsset || isSuppressed()) return;
+                utils.assetTrace('监听到 drop 事件');
+                const files = Array.from(event.dataTransfer?.files || []);
+                if (files.length > 0) broadcastFiles(files, 'drop');
+            }, true);
+
+            document.addEventListener('change', (event) => {
+                if (!event.isTrusted || state.isApplyingRemoteAsset || isSuppressed()) return;
+                const target = event.target;
+                if (!(target instanceof HTMLInputElement) || target.type !== 'file') return;
+                utils.assetTrace('监听到 file input change 事件');
+                const files = Array.from(target.files || []);
+                if (files.length > 0) broadcastFiles(files, 'file-input');
+            }, true);
+        };
+
+        const handleAssetFound = async (assets, sourceSite, targets) => {
+            const { utils, config, elements } = AITabSync;
+            if (!sourceSite || !targets?.length) return;
+
+            const normalizedAssets = (Array.isArray(assets) ? assets : [assets]).filter((asset) => !!asset?.dataUrl);
+            if (normalizedAssets.length === 0) return;
+
+            const assetMessageId = `${sourceSite.id}-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
+
+            utils.log(`准备从 ${sourceSite.id} 广播资产`, {
+                targets,
+                count: normalizedAssets.length,
+                assets: normalizedAssets.slice(0, 5).map((asset) => ({
+                    name: asset.name,
+                    mimeType: asset.mimeType,
+                    size: asset.size,
+                    origin: asset.origin,
+                })),
+            });
+            utils.assetTrace('写入共享资产消息', {
+                assetMessageId,
+                sourceId: sourceSite.id,
+                targets,
+                count: normalizedAssets.length,
+            });
+
+            if (elements.fab) {
+                elements.fab.classList.add('sending');
+                setTimeout(() => elements.fab?.classList.remove('sending'), 2000);
+            }
+
+            await infra.storage.set(config.KEYS.SHARED_ASSET, JSON.stringify({
+                assetMessageId,
+                timestamp: Date.now(),
+                sourceId: sourceSite.id,
+                targetIds: targets,
+                assetCount: normalizedAssets.length,
+                assets: normalizedAssets,
+                asset: normalizedAssets[0]
+            }));
+        };
+
+        const processAssetSubmission = async (site, asset) => {
+            const { utils, state, config } = AITabSync;
+            if (!asset?.dataUrl) return;
+
+            state.isApplyingRemoteAsset = true;
+            try {
+                const file = utils.createFileFromAsset(asset);
+                const uploadRule = utils.getAssetUploadRule(site.id);
+                utils.assetTrace('开始远端资产注入', {
+                    site: site.id,
+                    name: file.name,
+                    type: file.type,
+                    size: file.size,
+                    uploadRule,
+                });
+
+                const isImageAsset = String(asset.mimeType || '').startsWith('image/');
+                const canUsePasteForImage = uploadRule.enablePasteForImage !== false;
+                const canUseFileInput = isImageAsset
+                    ? uploadRule.enableFileInputFallbackForImage !== false
+                    : uploadRule.enableFileInputForNonImage !== false;
+                let inputArea = null;
+
+                const tryDropInjection = async (stage) => {
+                    if (!inputArea) return false;
+                    inputArea.focus();
+                    const before = utils.takeAssetDomSnapshot(inputArea);
+                    utils.dispatchDropWithFile(inputArea, file);
+                    await new Promise((resolve) => setTimeout(resolve, config.TIMINGS.PASTE_VERIFY_DELAY));
+                    const after = utils.takeAssetDomSnapshot(inputArea);
+                    const dropVerified = utils.isAssetLikelyAttached(before, after);
+                    utils.assetTrace('drop 注入后校验结果', {
+                        site: site.id,
+                        stage,
+                        dropVerified,
+                        before,
+                        after,
+                    });
+                    return dropVerified;
+                };
+
+                if (isImageAsset && canUsePasteForImage) {
+                    inputArea = await utils.waitFor(() => utils.findBestInputArea(site), config.TIMINGS.SUBMIT_TIMEOUT, '输入框');
+                    inputArea.focus();
+                    const pasteBefore = utils.takeAssetDomSnapshot(inputArea);
+                    utils.dispatchPasteWithFile(inputArea, file);
+                    await new Promise((resolve) => setTimeout(resolve, config.TIMINGS.PASTE_VERIFY_DELAY));
+                    const pasteAfter = utils.takeAssetDomSnapshot(inputArea);
+                    const pasteVerified = utils.isAssetLikelyAttached(pasteBefore, pasteAfter);
+                    utils.assetTrace('paste 注入后校验结果', {
+                        site: site.id,
+                        pasteVerified,
+                        pasteBefore,
+                        pasteAfter,
+                    });
+                    if (pasteVerified) {
+                        utils.assetTrace('paste 注入已生效，结束流程', { site: site.id });
+                        return;
+                    }
+
+                    const dropAfterPasteVerified = await tryDropInjection('image-after-paste');
+                    if (dropAfterPasteVerified) {
+                        utils.assetTrace('drop 注入已生效，结束流程', { site: site.id, stage: 'image-after-paste' });
+                        return;
+                    }
+                }
+
+                if (canUseFileInput) {
+                    let fileInput = utils.findBestFileInput(file);
+                    if (!fileInput) {
+                        utils.assetTrace('未立即找到可用 file input，尝试触发上传入口', { site: site.id });
+                        fileInput = await utils.discoverFileInputViaTrigger(file, config.TIMINGS.FILE_INPUT_DISCOVERY_TIMEOUT);
+                    }
+
+                    if (fileInput) {
+                        fileInput.focus();
+                        const fileInputBefore = utils.takeAssetDomSnapshot(fileInput);
+                        const changed = utils.dispatchFileInputChange(fileInput, file);
+                        await new Promise((resolve) => setTimeout(resolve, config.TIMINGS.FILE_INPUT_VERIFY_DELAY));
+                        const fileInputAfter = utils.takeAssetDomSnapshot(fileInput);
+                        const fileInputVerified = !!(fileInput.files && fileInput.files.length > 0)
+                            || utils.isAssetLikelyAttached(fileInputBefore, fileInputAfter);
+                        utils.assetTrace('file input 注入后校验结果', {
+                            site: site.id,
+                            changed,
+                            fileInputVerified,
+                            fileInputBefore,
+                            fileInputAfter,
+                        });
+                        if (fileInputVerified) {
+                            utils.assetTrace('file input 注入已生效，结束流程', { site: site.id });
+                            return;
+                        }
+                    } else {
+                        utils.assetTrace('未找到可用 file input，无法执行 file input 注入', { site: site.id });
+                    }
+                }
+
+                if (!inputArea) {
+                    try {
+                        inputArea = await utils.waitFor(() => utils.findBestInputArea(site), config.TIMINGS.FILE_INPUT_DISCOVERY_TIMEOUT, '输入框');
+                    } catch (e) { }
+                }
+
+                if (inputArea) {
+                    const dropFinalVerified = await tryDropInjection(isImageAsset ? 'image-final' : 'non-image-final');
+                    if (dropFinalVerified) {
+                        utils.assetTrace('最终 drop 注入已生效，结束流程', {
+                            site: site.id,
+                            stage: isImageAsset ? 'image-final' : 'non-image-final'
+                        });
+                        return;
+                    }
+                }
+
+                if (!canUseFileInput) {
+                    utils.assetTrace('当前资产类型按站点规则禁用 file input，结束注入流程', {
+                        site: site.id,
+                        isImageAsset,
+                    });
+                } else {
+                    utils.assetTrace('资产注入未通过任何通道校验', {
+                        site: site.id,
+                        isImageAsset,
+                        fileName: file.name,
+                    });
+                }
+            } catch (error) {
+                utils.log('应用远端资产失败', error);
+                utils.assetTrace('远端资产注入异常', error);
+            } finally {
+                // 关键注释：远端注入后短抑制，避免站点回填触发本地监听再次广播。
+                state.suppressLocalAssetCaptureUntil = Date.now() + config.TIMINGS.REMOTE_ASSET_SUPPRESS_WINDOW;
+                utils.assetTrace('设置本地资产捕获抑制窗口', {
+                    site: site.id,
+                    suppressMs: config.TIMINGS.REMOTE_ASSET_SUPPRESS_WINDOW,
+                });
+                setTimeout(() => {
+                    state.isApplyingRemoteAsset = false;
+                }, config.TIMINGS.REMOTE_ASSET_SUPPRESS_WINDOW);
+            }
+        };
+
+        const processSharedAsset = async (value) => {
+            const { state, utils, config } = AITabSync;
+            if (state.isProcessingAssetTask || !value) return;
+            state.isProcessingAssetTask = true;
+
+            try {
+                const data = JSON.parse(value);
+                utils.assetTrace('收到共享资产消息', {
+                    sourceId: data.sourceId,
+                    targetIds: data.targetIds,
+                    assetMessageId: data.assetMessageId,
+                    ageMs: Date.now() - data.timestamp,
+                    currentSite: state.thisSite.id,
+                });
+                const isExpired = Date.now() - data.timestamp >= config.TIMINGS.ASSET_FRESHNESS_THRESHOLD;
+                if (isExpired) {
+                    utils.assetTrace('共享资产过期，删除消息', { assetMessageId: data.assetMessageId });
+                    await infra.storage.del(config.KEYS.SHARED_ASSET);
+                    return;
+                }
+                if (!data.targetIds?.includes(state.thisSite.id)) return;
+
+                utils.gcMapByAge(state.processedAssetMessageIds, config.TIMINGS.ASSET_PROCESSED_ID_TTL);
+                const messageId = data.assetMessageId || `${data.sourceId || 'unknown'}:${data.timestamp || 0}`;
+                // 关键注释：messageId 幂等消费，避免多标签并发重复处理同一资产消息。
+                if (state.processedAssetMessageIds.has(messageId)) {
+                    utils.log('跳过已处理资产消息', { messageId, site: state.thisSite.id });
+                    utils.assetTrace('命中接收端幂等去重，跳过注入', { messageId, site: state.thisSite.id });
+                    return;
+                }
+                state.processedAssetMessageIds.set(messageId, Date.now());
+                utils.assetTrace('通过接收端幂等检查，开始注入', { messageId, site: state.thisSite.id });
+
+                const incomingAssets = Array.isArray(data.assets) && data.assets.length > 0
+                    ? data.assets
+                    : (data.asset ? [data.asset] : []);
+                if (incomingAssets.length === 0) {
+                    utils.assetTrace('共享资产消息未包含有效资产数据，跳过', { messageId });
+                    return;
+                }
+
+                for (const asset of incomingAssets) {
+                    await processAssetSubmission(state.thisSite, asset);
+                }
+            } catch (error) {
+                utils.log('处理共享资产失败', error);
+                utils.assetTrace('处理共享资产异常', error);
+            } finally {
+                state.isProcessingAssetTask = false;
+            }
+        };
+
+        const initReceiver = async () => {
+            const { utils, config } = AITabSync;
+            try {
+                await utils.waitFor(() => utils.findBestInputArea(AITabSync.state.thisSite), config.TIMINGS.SUBMIT_TIMEOUT, 'UI就绪');
+                const assetValue = await infra.storage.get(config.KEYS.SHARED_ASSET);
+                if (assetValue) processSharedAsset(assetValue);
+            } catch (error) { }
+
+            infra.storage.listen(config.KEYS.SHARED_ASSET, (name, old_value, new_value, remote) => {
+                if (remote && new_value) {
+                    try {
+                        if (JSON.parse(new_value).sourceId !== AITabSync.state.thisSite.id) processSharedAsset(new_value);
+                    } catch (e) { }
+                }
+            });
+        };
+
+        return {
+            deployAssetSyncListeners,
+            handleAssetFound,
+            processSharedAsset,
+            processAssetSubmission,
+            initReceiver,
+        };
+    })(CoreModule, InfraModule);
+
+    // 关键注释：App 模块只负责启动编排，不放业务逻辑，保持入口单一。
+    const AppModule = (() => ({
+        start() {
+            // 关键注释：先执行启动自检，失败即停止初始化，避免带病运行。
+            if (!StabilityModule.runStartupSanityChecks('pre-init', { strictMode: false })) return;
+
+            if (MainModule.initEarly()) {
+                if (document.readyState === 'loading') {
+                    document.addEventListener('DOMContentLoaded', () => MainModule.initDOMReady());
+                } else {
+                    MainModule.initDOMReady();
+                }
+            }
+        },
+    }))();
+
+    AppModule.start();
 })();
