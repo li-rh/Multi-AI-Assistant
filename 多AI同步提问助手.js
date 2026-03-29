@@ -43,10 +43,10 @@
  *
  * 【功能核验（继承 + 本版新增）】
  * 1. 文本同步分发：原两份脚本均已具备（继承能力）。
- * 2. 图片同步（粘贴）：来自“多模型同时回答 & 目录导航.js”（继承能力）。
+ * 2. 图片/文件同步（当前 drop-only）：用于验证拖拽通道跨站兼容性（测试能力）。
  * 3. 网络拦截提问 + 本地事件兜底：分别来自两份原脚本，当前版本做了融合（继承能力）。
  * 4. 选择状态同步、常用模型可见性、动画样式切换：来自“AI 对话助手(一键同步多模型).js”（继承能力）。
- * 5. 本版扩展一：在“图片同步”基础上扩展为“图片 + 通用文件同步”（当前排障阶段收敛为 paste-only）。
+ * 5. 本版扩展一：在“图片同步”基础上扩展为“图片 + 通用文件同步”（当前兼容性验证阶段收敛为 drop-only）。
  * 6. 本版扩展二：新增独立资产通道与状态隔离（SHARED_ASSET、资产过期控制、远端注入流程）。
  *
  * 【v3.1 更新日志】
@@ -57,21 +57,21 @@
  * 【v3.2 更新日志】
  * 1. 资产去重升级为“内容指纹去重”：基于 dataUrl 生成指纹，不再依赖文件元数据（name/lastModified），降低部分站点二次触发漏拦截概率。
  * 2. 抑制策略调整为“短抑制窗口”：REMOTE_ASSET_SUPPRESS_WINDOW 调整为 2500ms，减少对连续操作的影响。
- * 3. 资产去重窗口调整为 3000ms，覆盖常见站点 paste->change 的延迟链路。
+ * 3. 资产去重窗口调整为 3000ms，覆盖常见站点拖拽触发链路。
  *
  * 【v3.2-dev 调试增强】
  * 1. 新增“资产链路调试日志”独立开关（菜单可切换，默认关闭）。
- * 2. 覆盖 paste/去重命中/广播/接收/注入关键链路打点，便于定位少数站点异常双触发。
- * 3. 资产注入策略当前统一为 paste 通道，去除 drop/file input 回退链路。
+ * 2. 覆盖 drop/去重命中/广播/接收/注入关键链路打点，便于定位少数站点异常双触发。
+ * 3. 资产注入策略当前统一为 drop 通道，用于验证跨站点兼容性。
  *
  * 【v3.3-dev 注入策略重构（方案B）】
- * 1. 资产注入改为“两阶段”：先执行注入动作，再做短窗口结果校验；仅在未通过校验时触发回退。
- * 2. 移除“以 dispatchEvent 返回值判定上传成功”的逻辑，降低部分站点误判导致的重复注入。
- * 3. 上传规则拆分为“图片回退”与“非图片上传”两条通道：保留 TONGYI 的图片防重策略，同时恢复非图片文件上传能力。
+ * 1. 资产注入统一为 drop-only，聚焦拖拽通道兼容性验证。
+ * 2. 注入后取消 verify delay，直接执行 DOM/网络联合校验。
+ * 3. 移除多通道回退分支，降低链路复杂度并提升定位效率。
  *
  * 【最简使用】
  * 1. 点击右下角悬浮球，勾选目标模型。
- * 2. 在任一已支持页面正常提问/发送（或粘贴上传图片）。
+ * 2. 在任一已支持页面正常提问/发送（或拖拽上传图片/文件）。
  * 3. 脚本自动同步到其他已选中的目标标签页。
  * =================================================================================================
  */
@@ -102,9 +102,7 @@
             tooltipTimeoutId: null,
             animationStyle: 'spin',
             isSelectionSynced: true,
-            assetChannelToggles: {
-                paste: true,
-            },
+            assetSiteInjectionStrategies: {},
             isStrictModeEnabled: false,
             strictModeMenuCommandId: null,
         },
@@ -123,7 +121,7 @@
                 ANIMATION_STYLE: 'multi_sync_animation_style_v1.0',
                 SELECTION_SYNC_ENABLED: 'multi_sync_selection_sync_v1.0',
                 SHARED_SELECTION: 'multi_sync_shared_selection_v1.0',
-                ASSET_CHANNEL_SWITCHES: 'multi_sync_asset_channel_switches_v1.0',
+                ASSET_SITE_INJECTION_STRATEGIES: 'multi_sync_asset_site_injection_strategies_v1.0',
                 STRICT_MODE_ENABLED: 'multi_sync_strict_mode_v1.0',
             },
             TIMINGS: {
@@ -137,11 +135,13 @@
                 ASSET_DEDUP_WINDOW: 3000,
                 REMOTE_ASSET_SUPPRESS_WINDOW: 2500,
                 ASSET_PROCESSED_ID_TTL: 60000,
-                PASTE_VERIFY_DELAY: 500,
                 ASSET_NETWORK_VERIFY_WINDOW: 2800,
                 TOOLTIP_DELAY: 300,
             },
             DISPLAY_ORDER: ['AI_STUDIO', 'GEMINI', 'TONGYI', 'QWEN', 'YUANBAO', 'CHATGPT', 'CLAUDE', 'DOUBAO', 'DEEPSEEK', 'KIMI', 'GROK'],
+            ASSET_SITE_STRATEGY_RECOMMENDED: {
+                QWEN: 'drop',
+            },
             SITES: {
                 GROK: {
                     id: 'GROK',
@@ -738,15 +738,60 @@
                 return afterSnapshot.attachmentCount > beforeAttachmentCount
                     || afterSnapshot.fileInputFilledCount > beforeFileInputFilledCount;
             },
+            dispatchDropWithFile(target, file) {
+                const dt = new DataTransfer();
+                dt.items.add(file);
+                let dropEvent = null;
+                try {
+                    dropEvent = new DragEvent('drop', {
+                        dataTransfer: dt,
+                        bubbles: true,
+                        cancelable: true,
+                    });
+                } catch (error) {
+                    dropEvent = new Event('drop', { bubbles: true, cancelable: true });
+                    Object.defineProperty(dropEvent, 'dataTransfer', {
+                        value: dt,
+                        configurable: true,
+                    });
+                }
+                target.dispatchEvent(dropEvent);
+            },
             dispatchPasteWithFile(target, file) {
                 const dt = new DataTransfer();
                 dt.items.add(file);
-                const pasteEvent = new ClipboardEvent('paste', {
-                    clipboardData: dt,
-                    bubbles: true,
-                    cancelable: true
-                });
+                let pasteEvent = null;
+                try {
+                    pasteEvent = new ClipboardEvent('paste', {
+                        clipboardData: dt,
+                        bubbles: true,
+                        cancelable: true,
+                    });
+                } catch (error) {
+                    pasteEvent = new Event('paste', { bubbles: true, cancelable: true });
+                    Object.defineProperty(pasteEvent, 'clipboardData', {
+                        value: dt,
+                        configurable: true,
+                    });
+                }
                 target.dispatchEvent(pasteEvent);
+            },
+            getRecommendedAssetSiteStrategies() {
+                const { config } = AITabSync;
+                const strategies = config.DISPLAY_ORDER.reduce((acc, siteId) => {
+                    acc[siteId] = 'paste';
+                    return acc;
+                }, {});
+
+                const recommended = config.ASSET_SITE_STRATEGY_RECOMMENDED || {};
+                Object.keys(recommended).forEach((siteId) => {
+                    const strategy = recommended[siteId];
+                    if ((strategy === 'drop' || strategy === 'paste') && Object.prototype.hasOwnProperty.call(strategies, siteId)) {
+                        strategies[siteId] = strategy;
+                    }
+                });
+
+                return strategies;
             },
         },
 
@@ -1073,7 +1118,8 @@
                     #ai-sync-settings-panel {
                         background: #fff;
                         border-radius: 16px;
-                        width: 340px;
+                        width: min(92vw, 680px);
+                        max-height: min(88vh, 760px);
                         display: flex;
                         flex-direction: column;
                         box-shadow: 0 12px 40px rgba(0,0,0,0.2);
@@ -1081,9 +1127,10 @@
                         animation: ae-zoom-in 0.2s ease-out;
                     }
                     .ai-sync-settings-header {
-                        padding: 16px 24px;
+                        padding: 16px 20px;
                         border-bottom: 1px solid #f1f3f4;
                         background: #fff;
+                        flex-shrink: 0;
                     }
                     .ai-sync-settings-title {
                         margin: 0;
@@ -1093,11 +1140,11 @@
                     }
                     .ai-sync-settings-list {
                         display: grid;
-                        grid-template-columns: 1fr 1fr;
-                        gap: 10px;
-                        padding: 20px;
+                        grid-template-columns: repeat(2, minmax(0, 1fr));
+                        gap: 8px;
+                        padding: 14px 16px;
                         background: #fff;
-                        max-height: 400px;
+                        max-height: min(30vh, 250px);
                         overflow-y: auto;
                     }
                     .ai-sync-settings-item label {
@@ -1106,7 +1153,7 @@
                         cursor: pointer;
                         font-size: 14px;
                         color: #3c4043;
-                        padding: 10px 12px;
+                        padding: 8px 10px;
                         border-radius: 8px;
                         background-color: #f8f9fa;
                         transition: background 0.2s;
@@ -1153,8 +1200,95 @@
                         margin: 0 20px;
                     }
                     .ai-sync-settings-uigroup {
-                        padding: 10px 20px;
+                        padding: 10px 16px;
                         background: #fff;
+                        flex-shrink: 0;
+                    }
+                    .ai-sync-settings-strategy-section {
+                        padding: 12px 16px 16px;
+                        background: #fff;
+                        border-top: 1px solid #f1f3f4;
+                        display: flex;
+                        flex-direction: column;
+                        min-height: 0;
+                    }
+                    .ai-sync-settings-strategy-title {
+                        font-size: 13px;
+                        font-weight: 600;
+                        color: #3c4043;
+                        margin-bottom: 10px;
+                    }
+                    .ai-sync-settings-strategy-actions {
+                        display: flex;
+                        justify-content: flex-end;
+                        margin-bottom: 10px;
+                    }
+                    #ai-sync-apply-recommended-strategy-btn {
+                        all: unset;
+                        cursor: pointer;
+                        font-size: 12px;
+                        color: var(--ai-g-blue);
+                        border: 1px solid #dadce0;
+                        border-radius: 999px;
+                        padding: 4px 10px;
+                        background: #fff;
+                        transition: background 0.2s, border-color 0.2s;
+                    }
+                    #ai-sync-apply-recommended-strategy-btn:hover {
+                        background: #e8f0fe;
+                        border-color: #c6dafc;
+                    }
+                    .ai-sync-settings-strategy-list {
+                        display: grid;
+                        grid-template-columns: repeat(2, minmax(0, 1fr));
+                        gap: 10px;
+                        max-height: min(34vh, 320px);
+                        overflow-y: auto;
+                        padding-right: 2px;
+                    }
+                    .ai-sync-settings-strategy-row {
+                        display: flex;
+                        flex-direction: column;
+                        align-items: stretch;
+                        gap: 6px;
+                        background: #f8f9fa;
+                        border-radius: 8px;
+                        padding: 10px;
+                        border: 1px solid #eceff1;
+                    }
+                    .ai-sync-settings-strategy-row span {
+                        font-size: 13px;
+                        font-weight: 500;
+                        color: #3c4043;
+                    }
+                    .ai-sync-site-injection-select {
+                        border: 1px solid #dadce0;
+                        border-radius: 6px;
+                        padding: 4px 8px;
+                        font-size: 12px;
+                        color: #202124;
+                        background: #fff;
+                        width: 100%;
+                    }
+                    @media (max-width: 620px) {
+                        #ai-sync-settings-panel {
+                            width: min(96vw, 460px);
+                        }
+                        .ai-sync-settings-list,
+                        .ai-sync-settings-strategy-list {
+                            grid-template-columns: 1fr;
+                        }
+                    }
+                    @media (max-height: 760px) {
+                        #ai-sync-settings-panel {
+                            max-height: 92vh;
+                        }
+                        .ai-sync-settings-list {
+                            max-height: min(28vh, 220px);
+                        }
+                        .ai-sync-settings-strategy-list {
+                            max-height: min(32vh, 280px);
+                        }
                     }
                     .ai-sync-settings-toggle {
                         display: flex;
@@ -1402,34 +1536,52 @@
                 uiGroupSync.appendChild(toggleContainerSync);
                 panel.appendChild(uiGroupSync);
 
-                const createAssetChannelToggle = (labelText, channelKey, checked) => {
-                    const group = document.createElement('div');
-                    group.className = 'ai-sync-settings-uigroup';
-                    const container = document.createElement('div');
-                    container.className = 'ai-sync-settings-toggle';
-                    const label = document.createElement('span');
-                    label.textContent = labelText;
-                    container.appendChild(label);
-                    const switchLabel = document.createElement('label');
-                    switchLabel.className = 'toggle-switch';
-                    const switchInput = document.createElement('input');
-                    switchInput.type = 'checkbox';
-                    switchInput.className = 'ai-sync-asset-channel-toggle';
-                    switchInput.dataset.channel = channelKey;
-                    switchInput.checked = !!checked;
-                    const switchTrack = document.createElement('div');
-                    switchTrack.className = 'toggle-switch-track';
-                    const switchThumb = document.createElement('div');
-                    switchThumb.className = 'toggle-switch-thumb';
-                    switchTrack.appendChild(switchThumb);
-                    switchLabel.appendChild(switchInput);
-                    switchLabel.appendChild(switchTrack);
-                    container.appendChild(switchLabel);
-                    group.appendChild(container);
-                    return group;
-                };
+                const strategySection = document.createElement('div');
+                strategySection.className = 'ai-sync-settings-strategy-section';
+                const strategyTitle = document.createElement('div');
+                strategyTitle.className = 'ai-sync-settings-strategy-title';
+                strategyTitle.textContent = '站点注入策略（资产）';
+                strategySection.appendChild(strategyTitle);
 
-                panel.appendChild(createAssetChannelToggle('资产通道：Paste', 'paste', state.assetChannelToggles?.paste !== false));
+                const strategyActions = document.createElement('div');
+                strategyActions.className = 'ai-sync-settings-strategy-actions';
+                const applyRecommendedBtn = document.createElement('button');
+                applyRecommendedBtn.id = 'ai-sync-apply-recommended-strategy-btn';
+                applyRecommendedBtn.type = 'button';
+                applyRecommendedBtn.textContent = '应用推荐注入策略';
+                strategyActions.appendChild(applyRecommendedBtn);
+                strategySection.appendChild(strategyActions);
+
+                const strategyList = document.createElement('div');
+                strategyList.className = 'ai-sync-settings-strategy-list';
+                config.DISPLAY_ORDER.forEach((siteId) => {
+                    const site = config.SITES[siteId];
+                    if (!site) return;
+                    const row = document.createElement('div');
+                    row.className = 'ai-sync-settings-strategy-row';
+                    const siteName = document.createElement('span');
+                    siteName.textContent = site.name;
+                    const select = document.createElement('select');
+                    select.className = 'ai-sync-site-injection-select';
+                    select.dataset.siteId = siteId;
+                    const strategy = state.assetSiteInjectionStrategies?.[siteId] === 'paste' ? 'paste' : 'drop';
+
+                    const optionDrop = document.createElement('option');
+                    optionDrop.value = 'drop';
+                    optionDrop.textContent = '拖拽 (drop)';
+                    const optionPaste = document.createElement('option');
+                    optionPaste.value = 'paste';
+                    optionPaste.textContent = '粘贴 (paste)';
+                    select.appendChild(optionDrop);
+                    select.appendChild(optionPaste);
+                    select.value = strategy;
+
+                    row.appendChild(siteName);
+                    row.appendChild(select);
+                    strategyList.appendChild(row);
+                });
+                strategySection.appendChild(strategyList);
+                panel.appendChild(strategySection);
 
                 overlay.appendChild(panel);
                 document.body.appendChild(overlay);
@@ -1539,7 +1691,8 @@
             async onSettingsChange(event) { return EventsModule.onSettingsChange(event); },
             async onAnimationToggleChange(event) { return EventsModule.onAnimationToggleChange(event); },
             async onSelectionSyncToggleChange(event) { return EventsModule.onSelectionSyncToggleChange(event); },
-            async onAssetChannelToggleChange(event) { return EventsModule.onAssetChannelToggleChange(event); },
+            async onSiteInjectionStrategyChange(event) { return EventsModule.onSiteInjectionStrategyChange(event); },
+            async onApplyRecommendedSiteStrategies() { return EventsModule.onApplyRecommendedSiteStrategies(); },
             onClickOutside(event) { return EventsModule.onClickOutside(event); },
             onChipMouseOver(event) { return EventsModule.onChipMouseOver(event); },
             onChipMouseOut(event) { return EventsModule.onChipMouseOut(event); },
@@ -1807,17 +1960,18 @@
             }
             state.animationStyle = await infra.storage.get(config.KEYS.ANIMATION_STYLE, 'spin');
             state.isSelectionSynced = await infra.storage.get(config.KEYS.SELECTION_SYNC_ENABLED, true);
-            const savedAssetChannelToggles = await infra.storage.get(config.KEYS.ASSET_CHANNEL_SWITCHES, null);
-            const defaultAssetChannelToggles = {
-                paste: true,
-            };
-            if (savedAssetChannelToggles && typeof savedAssetChannelToggles === 'object') {
-                state.assetChannelToggles = {
-                    paste: savedAssetChannelToggles.paste !== false,
-                };
+            const defaultSiteStrategies = AITabSync.utils.getRecommendedAssetSiteStrategies();
+            const savedSiteStrategies = await infra.storage.get(config.KEYS.ASSET_SITE_INJECTION_STRATEGIES, null);
+            state.assetSiteInjectionStrategies = { ...defaultSiteStrategies };
+            if (savedSiteStrategies && typeof savedSiteStrategies === 'object') {
+                Object.keys(defaultSiteStrategies).forEach((siteId) => {
+                    const strategy = savedSiteStrategies[siteId];
+                    if (strategy === 'drop' || strategy === 'paste') {
+                        state.assetSiteInjectionStrategies[siteId] = strategy;
+                    }
+                });
             } else {
-                state.assetChannelToggles = defaultAssetChannelToggles;
-                await infra.storage.set(config.KEYS.ASSET_CHANNEL_SWITCHES, state.assetChannelToggles);
+                await infra.storage.set(config.KEYS.ASSET_SITE_INJECTION_STRATEGIES, state.assetSiteInjectionStrategies);
             }
             state.isStrictModeEnabled = await infra.storage.get(config.KEYS.STRICT_MODE_ENABLED, false);
             if (state.isSelectionSynced) {
@@ -1856,11 +2010,16 @@
                     ui.updateSelectAllButtonState();
                 }
             });
-            infra.storage.listen(config.KEYS.ASSET_CHANNEL_SWITCHES, (name, ov, nv) => {
+            infra.storage.listen(config.KEYS.ASSET_SITE_INJECTION_STRATEGIES, (name, ov, nv) => {
                 if (nv && typeof nv === 'object') {
-                    state.assetChannelToggles = {
-                        paste: nv.paste !== false,
-                    };
+                    const nextStrategies = { ...state.assetSiteInjectionStrategies };
+                    Object.keys(nextStrategies).forEach((siteId) => {
+                        const strategy = nv[siteId];
+                        if (strategy === 'drop' || strategy === 'paste') {
+                            nextStrategies[siteId] = strategy;
+                        }
+                    });
+                    state.assetSiteInjectionStrategies = nextStrategies;
                 }
             });
             infra.storage.listen(config.KEYS.STRICT_MODE_ENABLED, (name, ov, nv) => {
@@ -1950,9 +2109,11 @@
             elements.settingsModal.querySelector('.ai-sync-settings-list').addEventListener('change', onSettingsChange);
             elements.settingsModal.querySelector('#ai-sync-animation-toggle').addEventListener('change', onAnimationToggleChange);
             elements.settingsModal.querySelector('#ai-sync-selection-sync-toggle').addEventListener('change', onSelectionSyncToggleChange);
-            elements.settingsModal.querySelectorAll('.ai-sync-asset-channel-toggle').forEach((toggleEl) => {
-                toggleEl.addEventListener('change', onAssetChannelToggleChange);
+            elements.settingsModal.querySelectorAll('.ai-sync-site-injection-select').forEach((selectEl) => {
+                selectEl.addEventListener('change', onSiteInjectionStrategyChange);
             });
+            elements.settingsModal.querySelector('#ai-sync-apply-recommended-strategy-btn')
+                ?.addEventListener('click', onApplyRecommendedSiteStrategies);
             elements.container.addEventListener('mouseover', onChipMouseOver, true);
             elements.container.addEventListener('mouseout', onChipMouseOut, true);
         };
@@ -2056,18 +2217,36 @@
             }
         };
 
-        const onAssetChannelToggleChange = async (event) => {
+        const onSiteInjectionStrategyChange = async (event) => {
             const { state, config, utils } = AITabSync;
             const target = event.target;
-            const channel = target?.dataset?.channel;
-            if (!channel) return;
-            const nextToggles = {
-                paste: state.assetChannelToggles?.paste !== false,
-                [channel]: !!target.checked,
+            const siteId = target?.dataset?.siteId;
+            const strategy = target?.value;
+            if (!siteId || (strategy !== 'drop' && strategy !== 'paste')) return;
+
+            const nextStrategies = {
+                ...state.assetSiteInjectionStrategies,
+                [siteId]: strategy,
             };
-            state.assetChannelToggles = nextToggles;
-            await infra.storage.set(config.KEYS.ASSET_CHANNEL_SWITCHES, nextToggles);
-            utils.log('资产通道开关已更新', nextToggles);
+            state.assetSiteInjectionStrategies = nextStrategies;
+            await infra.storage.set(config.KEYS.ASSET_SITE_INJECTION_STRATEGIES, nextStrategies);
+            utils.log('站点资产注入策略已更新', { siteId, strategy });
+        };
+
+        const onApplyRecommendedSiteStrategies = async () => {
+            const { state, config, utils, elements } = AITabSync;
+            const nextStrategies = utils.getRecommendedAssetSiteStrategies();
+
+            state.assetSiteInjectionStrategies = nextStrategies;
+            await infra.storage.set(config.KEYS.ASSET_SITE_INJECTION_STRATEGIES, nextStrategies);
+
+            elements.settingsModal?.querySelectorAll('.ai-sync-site-injection-select').forEach((selectEl) => {
+                const siteId = selectEl?.dataset?.siteId;
+                if (!siteId) return;
+                selectEl.value = nextStrategies[siteId] || 'paste';
+            });
+
+            utils.log('已应用推荐站点资产注入策略', nextStrategies);
         };
 
         const onClickOutside = (event) => {
@@ -2129,7 +2308,8 @@
             onSettingsChange,
             onAnimationToggleChange,
             onSelectionSyncToggleChange,
-            onAssetChannelToggleChange,
+            onSiteInjectionStrategyChange,
+            onApplyRecommendedSiteStrategies,
             onClickOutside,
             onChipMouseOver,
             onChipMouseOut,
@@ -2484,7 +2664,7 @@
                         utils.gcMapByAge(state.recentAssetFingerprints, AITabSync.config.TIMINGS.ASSET_DEDUP_WINDOW);
                         const fingerprint = utils.makeDataUrlFingerprint(dataUrl);
                         const lastSeen = state.recentAssetFingerprints.get(fingerprint) || 0;
-                        // 关键注释：内容指纹窗口去重，防止同一资产在 paste 链路重复广播。
+                        // 关键注释：内容指纹窗口去重，防止同一资产在 drop 链路重复广播。
                         if (Date.now() - lastSeen < AITabSync.config.TIMINGS.ASSET_DEDUP_WINDOW) {
                             utils.log('跳过重复资产广播（命中内容去重窗口）', { origin, fingerprint, name: file.name });
                             utils.assetTrace('命中内容去重，跳过广播', {
@@ -2518,20 +2698,29 @@
                 }
             };
 
+            document.addEventListener('drop', (event) => {
+                if (!event.isTrusted || state.isApplyingRemoteAsset || isSuppressed()) return;
+                utils.assetTrace('监听到 drop 事件');
+                const files = Array.from(event.dataTransfer?.files || []);
+                if (files.length > 0) broadcastFiles(files, 'drop');
+            }, true);
+
             document.addEventListener('paste', (event) => {
                 if (!event.isTrusted || state.isApplyingRemoteAsset || isSuppressed()) return;
-                utils.assetTrace('监听到 paste 事件');
                 const items = event.clipboardData?.items;
                 if (!items?.length) return;
+
                 const files = [];
-                for (let i = 0; i < items.length; i++) {
-                    const item = items[i];
-                    if (item.kind === 'file') {
-                        const file = item.getAsFile();
-                        if (file) files.push(file);
-                    }
+                for (let index = 0; index < items.length; index++) {
+                    const item = items[index];
+                    if (item?.kind !== 'file') continue;
+                    const file = item.getAsFile();
+                    if (file) files.push(file);
                 }
-                if (files.length > 0) broadcastFiles(files, 'paste');
+
+                if (files.length === 0) return;
+                utils.assetTrace('监听到 paste 事件（文件/图片）', { fileCount: files.length });
+                broadcastFiles(files, 'paste');
             }, true);
         };
 
@@ -2590,44 +2779,41 @@
                     type: file.type,
                     size: file.size,
                 });
-                const channelToggles = state.assetChannelToggles || {};
-                const isPasteChannelEnabled = channelToggles.paste !== false;
-                if (!isPasteChannelEnabled) {
-                    utils.assetTrace('paste 通道已关闭，结束注入流程', {
-                        site: site.id,
-                        fileName: file.name,
-                    });
-                    return;
-                }
+                const strategy = state.assetSiteInjectionStrategies?.[site.id] === 'paste' ? 'paste' : 'drop';
 
                 const inputArea = await utils.waitFor(() => utils.findBestInputArea(site), config.TIMINGS.SUBMIT_TIMEOUT, '输入框');
                 inputArea.focus();
-                const pasteBefore = utils.takeAssetDomSnapshot(inputArea);
-                const pasteStartedAt = Date.now();
-                utils.dispatchPasteWithFile(inputArea, file);
-                await new Promise((resolve) => setTimeout(resolve, config.TIMINGS.PASTE_VERIFY_DELAY));
-                const pasteAfter = utils.takeAssetDomSnapshot(inputArea);
-                const pasteVerifiedByDom = utils.isAssetLikelyAttached(pasteBefore, pasteAfter);
-                const pasteVerifiedByNetwork = pasteVerifiedByDom
+                const beforeSnapshot = utils.takeAssetDomSnapshot(inputArea);
+                const startedAt = Date.now();
+                if (strategy === 'paste') {
+                    utils.dispatchPasteWithFile(inputArea, file);
+                } else {
+                    utils.dispatchDropWithFile(inputArea, file);
+                }
+                const afterSnapshot = utils.takeAssetDomSnapshot(inputArea);
+                const verifiedByDom = utils.isAssetLikelyAttached(beforeSnapshot, afterSnapshot);
+                const verifiedByNetwork = verifiedByDom
                     ? false
-                    : await utils.waitForOutboundAssetSignal(pasteStartedAt, config.TIMINGS.ASSET_NETWORK_VERIFY_WINDOW);
-                const pasteVerified = pasteVerifiedByDom || pasteVerifiedByNetwork;
-                utils.assetTrace('paste 注入后校验结果', {
+                    : await utils.waitForOutboundAssetSignal(startedAt, config.TIMINGS.ASSET_NETWORK_VERIFY_WINDOW);
+                const verified = verifiedByDom || verifiedByNetwork;
+                utils.assetTrace(`${strategy} 注入后校验结果`, {
                     site: site.id,
-                    pasteVerified,
-                    pasteVerifiedByDom,
-                    pasteVerifiedByNetwork,
-                    pasteBefore,
-                    pasteAfter,
+                    strategy,
+                    verified,
+                    verifiedByDom,
+                    verifiedByNetwork,
+                    beforeSnapshot,
+                    afterSnapshot,
                 });
 
-                if (pasteVerified) {
-                    utils.assetTrace('paste 注入已生效，结束流程', { site: site.id });
+                if (verified) {
+                    utils.assetTrace(`${strategy} 注入已生效，结束流程`, { site: site.id });
                     return;
                 }
 
-                utils.assetTrace('资产注入未通过 paste 通道校验', {
+                utils.assetTrace('资产注入未通过策略校验', {
                     site: site.id,
+                    strategy,
                     fileName: file.name,
                 });
             } catch (error) {

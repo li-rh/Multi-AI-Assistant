@@ -24,10 +24,10 @@
 |---|---|---|---|
 | 文本同步主链路 | ✅ 已实现 | 网络拦截 `XHR/fetch` 提取 query 后广播 `SHARED_QUERY` | 主路径稳定 |
 | 文本同步兜底 | ✅ 已实现 | 本地发送兜底：监听 `keydown/click` 判断发送行为 | 作为主链路补偿 |
-| 资产同步入口 | ✅ 已实现 | 监听 `paste/drop/file-input(change)` 并广播 `SHARED_ASSET` | 覆盖图片+通用文件 |
+| 资产同步入口 | ✅ 已实现 | 监听 `paste/drop` 并广播 `SHARED_ASSET` | 覆盖图片+通用文件 |
 | 资产接收与消费 | ✅ 已实现 | 目标页按 `targetIds + freshness` 消费并注入 | 带幂等去重 |
-| 资产注入策略（v3.3） | ✅ 已实现 | 两阶段校验 + 多通道回退（paste/file-input/drop） | 不依赖 dispatch 返回值 |
-| 图片/非图片策略分流 | ✅ 已实现 | `enablePasteForImage` 与 `enableFileInputForNonImage` 分离 | 已避免策略误伤 |
+| 资产注入策略（v3.3） | ✅ 已实现 | 站点级策略（paste/drop）+ DOM/网络联合校验 | 可在 UI 单独配置 |
+| 推荐策略应用 | ✅ 已实现 | 首次安装自动应用推荐；设置页可一键重应用当前推荐 | 更新脚本默认保留本地存储策略 |
 | 选择状态跨标签同步 | ✅ 已实现 | `SELECTION_SYNC_ENABLED` + `SHARED_SELECTION` | 可开关 |
 | 活跃标签管理 | ✅ 已实现 | 心跳注册 + 过期清理 + URL 变化重注册 | UI 在线状态依赖该机制 |
 | 调试日志体系 | ✅ 已实现 | 普通日志 + 资产链路日志双开关 | 菜单可切换 |
@@ -72,7 +72,7 @@
 ### 4.2 资产链路
 
 - `deployAssetSyncListeners()`
-  - 捕获 `paste/drop/file-input(change)` 文件来源。
+  - 捕获 `paste/drop` 文件来源。
   - 内容指纹去重：`makeDataUrlFingerprint()` + `recentAssetFingerprints`。
 
 - `handleAssetFound()` / `processSharedAsset()`
@@ -80,10 +80,13 @@
   - 接收端基于 `assetMessageId` 幂等处理，避免重复消费。
 
 - `processAssetSubmission()`（v3.3 核心）
-  - 图片优先 `paste`（可按站点规则关闭/回退）。
-  - 非图片优先 `file input`。
+  - 按站点配置执行 `paste` 或 `drop` 注入。
   - 注入后通过 `takeAssetDomSnapshot()` 与 `isAssetLikelyAttached()` 做结果校验。
-  - 必要时尝试 `discoverFileInputViaTrigger()` 与 `drop` 回退。
+  - 若 DOM 未确认，则在窗口内等待网络上传信号补充校验。
+
+- `onSiteInjectionStrategyChange()` / `onApplyRecommendedSiteStrategies()`
+  - 支持单站点切换策略与一键应用推荐策略。
+  - 写入 `ASSET_SITE_INJECTION_STRATEGIES` 并跨标签同步。
 
 ### 4.3 状态与 UI
 
@@ -130,21 +133,20 @@
 
 ---
 
-## 6. 站点上传规则（当前内置）
+## 6. 站点注入策略（当前内置）
 
-默认规则：
+默认/推荐策略（当前实现）：
 
-- `enablePasteForImage: true`
-- `enableFileInputFallbackForImage: true`
-- `enableFileInputForNonImage: true`
+- 推荐策略由 `ASSET_SITE_STRATEGY_RECOMMENDED` 与站点列表组合生成。
+- 当前内置推荐为：`QWEN: drop`，其余站点默认 `paste`。
 
-`TONGYI` 特化：
+生效规则：
 
-- `enablePasteForImage: true`
-- `enableFileInputFallbackForImage: false`
-- `enableFileInputForNonImage: true`
+- 首次安装（本地无策略存储）时：自动写入并应用当前推荐策略。
+- 脚本后续更新时：默认读取并保留本地已存策略，不自动覆盖。
+- 点击“应用推荐注入策略”按钮时：按当前脚本版本推荐策略覆盖本地策略。
 
-说明：该分离策略用于“图片防重”与“非图片可传”并存。
+说明：可在设置页“站点注入策略（资产）”中逐站覆盖为 `paste` 或 `drop`。
 
 ---
 
@@ -167,8 +169,9 @@
 ### B. 资产链路
 
 1. 图片 `paste`：目标站点仅新增 1 份附件，无重复。
-2. 非图片 `file input`：目标站点出现文件附件芯片/上传预览。
-3. 通义 ↔ 元宝双向验证：图片与非图片均可按预期注入。
+2. 文件 `drop`：目标站点出现文件附件芯片/上传预览。
+3. 站点策略切换：同一目标站点切换 `paste/drop` 后注入方式随之变化。
+4. 通义 ↔ 元宝双向验证：图片与非图片均可按预期注入。
 
 ### C. 状态与控制面板
 
@@ -182,7 +185,7 @@
 
 - `v3.1`：资产去重与消费幂等初步完善。
 - `v3.2`：升级为内容指纹去重，优化抑制窗口。
-- `v3.2-dev`：增加资产链路调试日志与站点上传规则。
-- `v3.3-dev`：注入改为两阶段校验，拆分图片/非图片策略通道。
+- `v3.2-dev`：增加资产链路调试日志。
+- `v3.3-dev`：注入统一为 `paste/drop` 策略化执行，支持站点级配置与“一键应用推荐”。
 
 > 详细故障复盘与排障记录请参考 `DEBUG笔记/多AI同步提问助手跨标签文本与图片同步失效问题/` 下文档。
