@@ -1657,6 +1657,31 @@
                 btn.title = allSelected ? '全部取消' : '全选';
                 btn.style.color = allSelected ? 'var(--ai-g-blue)' : '#5f6368';
             },
+            syncSettingsModalState() {
+                const { elements, state } = AITabSync;
+                const modal = elements.settingsModal;
+                if (!modal) return;
+
+                modal.querySelectorAll('.ai-sync-settings-list input[type="checkbox"]').forEach((checkbox) => {
+                    checkbox.checked = state.visibleTargets.includes(checkbox.value);
+                });
+
+                const animationToggle = modal.querySelector('#ai-sync-animation-toggle');
+                if (animationToggle) {
+                    animationToggle.checked = state.animationStyle === 'spin';
+                }
+
+                const selectionSyncToggle = modal.querySelector('#ai-sync-selection-sync-toggle');
+                if (selectionSyncToggle) {
+                    selectionSyncToggle.checked = !!state.isSelectionSynced;
+                }
+
+                modal.querySelectorAll('.ai-sync-site-injection-select').forEach((selectEl) => {
+                    const siteId = selectEl?.dataset?.siteId;
+                    if (!siteId) return;
+                    selectEl.value = state.assetSiteInjectionStrategies?.[siteId] === 'paste' ? 'paste' : 'drop';
+                });
+            },
             togglePanelVisibility() {
                 const { container } = AITabSync.elements;
                 if (!container) return;
@@ -1683,7 +1708,19 @@
             },
         },
 
-        // --- 6. Event Handlers ---
+        // --- 6. Settings Sync ---
+        settingsSync: {
+            async applyVisibleTargets(targets, options) { return SettingsSyncModule.applyVisibleTargets(targets, options); },
+            async applyAnimationStyle(style, options) { return SettingsSyncModule.applyAnimationStyle(style, options); },
+            async applySelectionSyncEnabled(enabled, options) { return SettingsSyncModule.applySelectionSyncEnabled(enabled, options); },
+            async applyAssetSiteInjectionStrategies(strategies, options) { return SettingsSyncModule.applyAssetSiteInjectionStrategies(strategies, options); },
+            async applyRecommendedAssetSiteInjectionStrategies(options) { return SettingsSyncModule.applyRecommendedAssetSiteInjectionStrategies(options); },
+            async applyLoggingEnabled(enabled, options) { return SettingsSyncModule.applyLoggingEnabled(enabled, options); },
+            async applyAssetTraceEnabled(enabled, options) { return SettingsSyncModule.applyAssetTraceEnabled(enabled, options); },
+            async applyStrictModeEnabled(enabled, options) { return SettingsSyncModule.applyStrictModeEnabled(enabled, options); },
+        },
+
+        // --- 7. Event Handlers ---
         events: {
             register() { return EventsModule.register(); },
             async onChipClick(event) { return EventsModule.onChipClick(event); },
@@ -1701,7 +1738,7 @@
             async onToggleStrictMode() { return EventsModule.onToggleStrictMode(); },
         },
 
-        // --- 7. Lifecycle & Background Tasks ---
+        // --- 8. Lifecycle & Background Tasks ---
         lifecycle: {
             ensureWindowName() { return LifecycleModule.ensureWindowName(); },
             deployHistoryInterceptor() { return LifecycleModule.deployHistoryInterceptor(); },
@@ -1710,7 +1747,7 @@
             async cleanupStaleTabs() { return LifecycleModule.cleanupStaleTabs(); },
         },
 
-        // --- 8. Communication Module (IIFE 装配层) ---
+        // --- 9. Communication Module (IIFE 装配层) ---
         comms: {
             deployNetworkInterceptor() { return QuerySyncModule.deployNetworkInterceptor(); },
             deployLocalSendFallback() { return QuerySyncModule.deployLocalSendFallback(); },
@@ -1728,7 +1765,7 @@
             },
         },
 
-        // --- 9. Main Application Logic ---
+        // --- 10. Main Application Logic ---
         main: {
             async loadInitialState() { return MainModule.loadInitialState(); },
             registerGMListeners() { return MainModule.registerGMListeners(); },
@@ -1741,10 +1778,11 @@
     // =========================
     // 单文件 IIFE 伪模块化层（方案B）
     // =========================
-    // 模块关系：Core(状态/配置) -> Infra(外部能力) -> Lifecycle/Query/Asset/Main(业务域) -> App(启动入口)
+    // 模块关系：Core(状态/配置) -> Infra(外部能力) -> SettingsSync/Lifecycle/Query/Asset/Main(业务域) -> App(启动入口)
     // 公共 API 清单：
     // - Stability: runStartupSanityChecks
     // - Lifecycle: ensureWindowName / deployHistoryInterceptor / registerTabAsActive / unregisterTabAsInactive / cleanupStaleTabs
+    // - SettingsSync: applyVisibleTargets / applyAnimationStyle / applySelectionSyncEnabled / applyAssetSiteInjectionStrategies / applyLoggingEnabled / applyAssetTraceEnabled / applyStrictModeEnabled
     // - Events: register / onChipClick / onSelectAllClick / onSettingsChange / onAnimationToggleChange / onSelectionSyncToggleChange
     // - QuerySync: deployNetworkInterceptor / deployLocalSendFallback / handleQueryFound / processSharedQuery / processSubmission / initReceiver
     // - AssetSync: deployAssetSyncListeners / handleAssetFound / processSharedAsset / processAssetSubmission / initReceiver
@@ -1947,60 +1985,312 @@
         };
     })(CoreModule, InfraModule);
 
+    // 关键注释：SettingsSync 统一管理“配置落库 + 状态回写 + 界面刷新”，避免重复实现。
+    const SettingsSyncModule = ((core, infra) => {
+        const normalizeAnimationStyle = (style) => (style === 'aurora' ? 'aurora' : 'spin');
+        const normalizeBoolean = (value) => !!value;
+
+        /**
+         * @typedef {Object} BaseSettingOptions
+         * @property {boolean} [persist=false] 是否写回存储
+         * @property {boolean} [syncUI=true] 是否同步设置弹窗 UI
+         */
+
+        /**
+         * @typedef {BaseSettingOptions & {
+         *   rebuildPanel?: boolean
+         * }} VisibleTargetsOptions
+         */
+
+        /**
+         * @typedef {BaseSettingOptions & {
+         *   clearSharedSelectionOnDisable?: boolean
+         * }} SelectionSyncOptions
+         */
+
+        /**
+         * @typedef {BaseSettingOptions & {
+         *   mergeStrategies?: boolean
+         * }} SiteStrategiesOptions
+         */
+
+        /**
+         * @typedef {BaseSettingOptions & {
+         *   refreshMenuCommand?: boolean
+         * }} MenuSettingOptions
+         */
+
+        const normalizeVisibleTargets = (targets) => {
+            if (!Array.isArray(targets)) return [...core.config.DISPLAY_ORDER];
+            return core.config.DISPLAY_ORDER.filter((id) => targets.includes(id));
+        };
+
+        const resolveStrategySeed = (mergeStrategies) => {
+            const currentStrategies = core.state.assetSiteInjectionStrategies;
+            if (mergeStrategies && currentStrategies && typeof currentStrategies === 'object' && Object.keys(currentStrategies).length > 0) {
+                return { ...currentStrategies };
+            }
+            return core.utils.getRecommendedAssetSiteStrategies();
+        };
+
+        const normalizeSiteStrategies = (strategies, mergeStrategies = true) => {
+            const seed = resolveStrategySeed(mergeStrategies);
+            if (!strategies || typeof strategies !== 'object') return seed;
+            Object.keys(seed).forEach((siteId) => {
+                const strategy = strategies[siteId];
+                if (strategy === 'drop' || strategy === 'paste') {
+                    seed[siteId] = strategy;
+                }
+            });
+            return seed;
+        };
+
+        const applyFabAnimationClass = (style) => {
+            const fab = core.elements.fab;
+            if (!fab) return;
+            fab.classList.remove('animation-aurora', 'animation-spin', 'intro-playing');
+            fab.classList.add(style === 'spin' ? 'animation-spin' : 'animation-aurora');
+            if (style === 'spin') fab.classList.add('intro-playing');
+        };
+
+        const commitSetting = async (key, value, options = {}) => {
+            const {
+                persist = false,
+                applyState,
+                afterApply,
+                syncUI = true,
+            } = options;
+            if (persist) await infra.storage.set(key, value);
+            if (typeof applyState === 'function') applyState(value);
+            if (typeof afterApply === 'function') await afterApply(value);
+            if (syncUI) AITabSync.ui.syncSettingsModalState();
+            return value;
+        };
+
+        /** @param {string[]} targets @param {VisibleTargetsOptions} [options] */
+        const applyVisibleTargets = async (targets, options = {}) => {
+            const normalized = normalizeVisibleTargets(targets);
+            return commitSetting(core.config.KEYS.VISIBLE_TARGETS, normalized, {
+                persist: options.persist === true,
+                applyState: (nextTargets) => {
+                    core.state.visibleTargets = nextTargets;
+                    core.config.DISPLAY_ORDER.forEach((id) => {
+                        if (!nextTargets.includes(id) && core.state.selectedTargets.has(id)) {
+                            core.state.selectedTargets.delete(id);
+                        }
+                    });
+                },
+                afterApply: async () => {
+                    if (options.rebuildPanel !== false) {
+                        await AITabSync.ui.rebuildChipsUI();
+                    }
+                },
+                syncUI: options.syncUI !== false,
+            });
+        };
+
+        /** @param {'spin'|'aurora'|string} style @param {BaseSettingOptions} [options] */
+        const applyAnimationStyle = async (style, options = {}) => {
+            const normalized = normalizeAnimationStyle(style);
+            return commitSetting(core.config.KEYS.ANIMATION_STYLE, normalized, {
+                persist: options.persist === true,
+                applyState: (nextStyle) => {
+                    core.state.animationStyle = nextStyle;
+                    applyFabAnimationClass(nextStyle);
+                },
+                syncUI: options.syncUI !== false,
+            });
+        };
+
+        /** @param {boolean} enabled @param {SelectionSyncOptions} [options] */
+        const applySelectionSyncEnabled = async (enabled, options = {}) => {
+            const normalized = !!enabled;
+            await commitSetting(core.config.KEYS.SELECTION_SYNC_ENABLED, normalized, {
+                persist: options.persist === true,
+                applyState: (nextEnabled) => {
+                    core.state.isSelectionSynced = nextEnabled;
+                },
+                syncUI: options.syncUI !== false,
+            });
+
+            if (!normalized && options.clearSharedSelectionOnDisable === true) {
+                await infra.storage.del(core.config.KEYS.SHARED_SELECTION);
+            }
+            return normalized;
+        };
+
+        /** @param {Record<string, 'drop'|'paste'>|Object} strategies @param {SiteStrategiesOptions} [options] */
+        const applyAssetSiteInjectionStrategies = async (strategies, options = {}) => {
+            const normalized = normalizeSiteStrategies(strategies, options.mergeStrategies !== false);
+            return commitSetting(core.config.KEYS.ASSET_SITE_INJECTION_STRATEGIES, normalized, {
+                persist: options.persist === true,
+                applyState: (nextStrategies) => {
+                    core.state.assetSiteInjectionStrategies = nextStrategies;
+                },
+                syncUI: options.syncUI !== false,
+            });
+        };
+
+        /** @param {SiteStrategiesOptions} [options] */
+        const applyRecommendedAssetSiteInjectionStrategies = async (options = {}) => {
+            const recommended = core.utils.getRecommendedAssetSiteStrategies();
+            return applyAssetSiteInjectionStrategies(recommended, {
+                ...options,
+                mergeStrategies: false,
+            });
+        };
+
+        /** @param {boolean} enabled @param {MenuSettingOptions} [options] */
+        const applyLoggingEnabled = async (enabled, options = {}) => {
+            const normalized = normalizeBoolean(enabled);
+            return commitSetting(core.config.KEYS.LOGGING_ENABLED, normalized, {
+                persist: options.persist === true,
+                applyState: (nextValue) => {
+                    core.state.isLoggingEnabled = nextValue;
+                },
+                afterApply: () => {
+                    if (options.refreshMenuCommand !== false) AITabSync.ui.updateMenuCommand();
+                },
+                syncUI: false,
+            });
+        };
+
+        /** @param {boolean} enabled @param {MenuSettingOptions} [options] */
+        const applyAssetTraceEnabled = async (enabled, options = {}) => {
+            const normalized = normalizeBoolean(enabled);
+            return commitSetting(core.config.KEYS.ASSET_TRACE_ENABLED, normalized, {
+                persist: options.persist === true,
+                applyState: (nextValue) => {
+                    core.state.isAssetTraceEnabled = nextValue;
+                },
+                afterApply: () => {
+                    if (options.refreshMenuCommand !== false) AITabSync.ui.updateMenuCommand();
+                },
+                syncUI: false,
+            });
+        };
+
+        /** @param {boolean} enabled @param {MenuSettingOptions} [options] */
+        const applyStrictModeEnabled = async (enabled, options = {}) => {
+            const normalized = normalizeBoolean(enabled);
+            return commitSetting(core.config.KEYS.STRICT_MODE_ENABLED, normalized, {
+                persist: options.persist === true,
+                applyState: (nextValue) => {
+                    core.state.isStrictModeEnabled = nextValue;
+                },
+                afterApply: () => {
+                    if (options.refreshMenuCommand !== false) AITabSync.ui.updateMenuCommand();
+                },
+                syncUI: false,
+            });
+        };
+
+        return {
+            applyVisibleTargets,
+            applyAnimationStyle,
+            applySelectionSyncEnabled,
+            applyAssetSiteInjectionStrategies,
+            applyRecommendedAssetSiteInjectionStrategies,
+            applyLoggingEnabled,
+            applyAssetTraceEnabled,
+            applyStrictModeEnabled,
+        };
+    })(CoreModule, InfraModule);
+
     // 关键注释：Main 只做启动编排；协议细节下沉到 Query/Asset/Lifecycle 模块。
     const MainModule = ((core, infra) => {
         const loadInitialState = async () => {
-            const { state, config } = AITabSync;
-            state.isLoggingEnabled = await infra.storage.get(config.KEYS.LOGGING_ENABLED, false);
-            state.isAssetTraceEnabled = await infra.storage.get(config.KEYS.ASSET_TRACE_ENABLED, false);
-            state.visibleTargets = await infra.storage.get(config.KEYS.VISIBLE_TARGETS, null);
-            if (state.visibleTargets === null) {
-                state.visibleTargets = [...config.DISPLAY_ORDER];
-                await infra.storage.set(config.KEYS.VISIBLE_TARGETS, state.visibleTargets);
-            }
-            state.animationStyle = await infra.storage.get(config.KEYS.ANIMATION_STYLE, 'spin');
-            state.isSelectionSynced = await infra.storage.get(config.KEYS.SELECTION_SYNC_ENABLED, true);
-            const defaultSiteStrategies = AITabSync.utils.getRecommendedAssetSiteStrategies();
+            const { state, config, settingsSync } = AITabSync;
+
+            const loggingEnabled = await infra.storage.get(config.KEYS.LOGGING_ENABLED, false);
+            await settingsSync.applyLoggingEnabled(loggingEnabled, {
+                persist: false,
+                refreshMenuCommand: false,
+            });
+
+            const assetTraceEnabled = await infra.storage.get(config.KEYS.ASSET_TRACE_ENABLED, false);
+            await settingsSync.applyAssetTraceEnabled(assetTraceEnabled, {
+                persist: false,
+                refreshMenuCommand: false,
+            });
+
+            const storedVisibleTargets = await infra.storage.get(config.KEYS.VISIBLE_TARGETS, null);
+            const resolvedVisibleTargets = storedVisibleTargets === null
+                ? [...config.DISPLAY_ORDER]
+                : storedVisibleTargets;
+            await settingsSync.applyVisibleTargets(resolvedVisibleTargets, {
+                persist: storedVisibleTargets === null,
+                rebuildPanel: false,
+                syncUI: false,
+            });
+
+            const animationStyle = await infra.storage.get(config.KEYS.ANIMATION_STYLE, 'spin');
+            await settingsSync.applyAnimationStyle(animationStyle, {
+                persist: false,
+                syncUI: false,
+            });
+
+            const selectionSyncEnabled = await infra.storage.get(config.KEYS.SELECTION_SYNC_ENABLED, true);
+            await settingsSync.applySelectionSyncEnabled(selectionSyncEnabled, {
+                persist: false,
+                syncUI: false,
+            });
+
             const savedSiteStrategies = await infra.storage.get(config.KEYS.ASSET_SITE_INJECTION_STRATEGIES, null);
-            state.assetSiteInjectionStrategies = { ...defaultSiteStrategies };
             if (savedSiteStrategies && typeof savedSiteStrategies === 'object') {
-                Object.keys(defaultSiteStrategies).forEach((siteId) => {
-                    const strategy = savedSiteStrategies[siteId];
-                    if (strategy === 'drop' || strategy === 'paste') {
-                        state.assetSiteInjectionStrategies[siteId] = strategy;
-                    }
+                await settingsSync.applyAssetSiteInjectionStrategies(savedSiteStrategies, {
+                    persist: false,
+                    mergeStrategies: false,
+                    syncUI: false,
                 });
             } else {
-                await infra.storage.set(config.KEYS.ASSET_SITE_INJECTION_STRATEGIES, state.assetSiteInjectionStrategies);
+                await settingsSync.applyRecommendedAssetSiteInjectionStrategies({
+                    persist: true,
+                    syncUI: false,
+                });
             }
-            state.isStrictModeEnabled = await infra.storage.get(config.KEYS.STRICT_MODE_ENABLED, false);
+
+            const strictModeEnabled = await infra.storage.get(config.KEYS.STRICT_MODE_ENABLED, false);
+            await settingsSync.applyStrictModeEnabled(strictModeEnabled, {
+                persist: false,
+                refreshMenuCommand: false,
+            });
+
             if (state.isSelectionSynced) {
                 const sharedSelection = await infra.storage.get(config.KEYS.SHARED_SELECTION, '[]');
-                state.selectedTargets = new Set(JSON.parse(sharedSelection));
+                try {
+                    state.selectedTargets = new Set(JSON.parse(sharedSelection || '[]'));
+                } catch (error) {
+                    state.selectedTargets = new Set();
+                }
             }
         };
 
         const registerGMListeners = () => {
-            const { config, ui, state, utils } = AITabSync;
-            infra.storage.listen(config.KEYS.LOGGING_ENABLED, (name, ov, nv) => {
-                state.isLoggingEnabled = nv;
-                ui.updateMenuCommand();
+            const { config, ui, state, utils, settingsSync } = AITabSync;
+            infra.storage.listen(config.KEYS.LOGGING_ENABLED, async (name, ov, nv) => {
+                await settingsSync.applyLoggingEnabled(nv, { persist: false });
             });
-            infra.storage.listen(config.KEYS.ASSET_TRACE_ENABLED, (name, ov, nv) => {
-                state.isAssetTraceEnabled = nv;
-                ui.updateMenuCommand();
+            infra.storage.listen(config.KEYS.ASSET_TRACE_ENABLED, async (name, ov, nv) => {
+                await settingsSync.applyAssetTraceEnabled(nv, { persist: false });
             });
             infra.storage.listen(config.KEYS.ACTIVE_TABS, (name, ov, nv, remote) => {
                 if (remote) ui.updatePanelState();
             });
-            infra.storage.listen(config.KEYS.VISIBLE_TARGETS, (name, ov, nv) => {
-                const newTargets = JSON.parse(nv || '[]');
-                state.visibleTargets = newTargets;
-                const oldTargets = config.DISPLAY_ORDER;
-                oldTargets.forEach((id) => {
-                    if (!newTargets.includes(id) && state.selectedTargets.has(id)) state.selectedTargets.delete(id);
-                });
-                ui.rebuildChipsUI();
+            infra.storage.listen(config.KEYS.VISIBLE_TARGETS, async (name, ov, nv) => {
+                let newTargets = [];
+                try {
+                    newTargets = JSON.parse(nv || '[]');
+                } catch (error) {
+                    newTargets = [];
+                }
+                await settingsSync.applyVisibleTargets(newTargets, { persist: false });
+            });
+            infra.storage.listen(config.KEYS.ANIMATION_STYLE, async (name, ov, nv) => {
+                await settingsSync.applyAnimationStyle(nv, { persist: false });
+            });
+            infra.storage.listen(config.KEYS.SELECTION_SYNC_ENABLED, async (name, ov, nv) => {
+                await settingsSync.applySelectionSyncEnabled(nv, { persist: false });
             });
             infra.storage.listen(config.KEYS.SHARED_SELECTION, (name, ov, nv, remote) => {
                 if (remote && state.isSelectionSynced) {
@@ -2010,21 +2300,14 @@
                     ui.updateSelectAllButtonState();
                 }
             });
-            infra.storage.listen(config.KEYS.ASSET_SITE_INJECTION_STRATEGIES, (name, ov, nv) => {
-                if (nv && typeof nv === 'object') {
-                    const nextStrategies = { ...state.assetSiteInjectionStrategies };
-                    Object.keys(nextStrategies).forEach((siteId) => {
-                        const strategy = nv[siteId];
-                        if (strategy === 'drop' || strategy === 'paste') {
-                            nextStrategies[siteId] = strategy;
-                        }
-                    });
-                    state.assetSiteInjectionStrategies = nextStrategies;
-                }
+            infra.storage.listen(config.KEYS.ASSET_SITE_INJECTION_STRATEGIES, async (name, ov, nv) => {
+                await settingsSync.applyAssetSiteInjectionStrategies(nv, {
+                    persist: false,
+                    mergeStrategies: true,
+                });
             });
-            infra.storage.listen(config.KEYS.STRICT_MODE_ENABLED, (name, ov, nv) => {
-                state.isStrictModeEnabled = !!nv;
-                ui.updateMenuCommand();
+            infra.storage.listen(config.KEYS.STRICT_MODE_ENABLED, async (name, ov, nv) => {
+                await settingsSync.applyStrictModeEnabled(nv, { persist: false });
             });
         };
 
@@ -2101,7 +2384,10 @@
             elements.container.addEventListener('click', onChipClick);
             elements.container.querySelector('#ai-sync-select-all-btn').addEventListener('click', onSelectAllClick);
             elements.container.querySelector('#ai-sync-settings-btn').addEventListener('click', () => {
-                if (elements.settingsModal) elements.settingsModal.style.display = 'flex';
+                if (elements.settingsModal) {
+                    ui.syncSettingsModalState();
+                    elements.settingsModal.style.display = 'flex';
+                }
             });
             elements.settingsModal.addEventListener('click', (e) => {
                 if (e.target === elements.settingsModal) elements.settingsModal.style.display = 'none';
@@ -2180,72 +2466,53 @@
 
         const onSettingsChange = async (event) => {
             if (event.target.type !== 'checkbox') return;
-            const { config, state, ui } = AITabSync;
+            const { settingsSync } = AITabSync;
             const list = event.currentTarget;
             const checkboxes = list.querySelectorAll('input[type="checkbox"]:checked');
             const newVisibleTargets = Array.from(checkboxes).map((cb) => cb.value);
-            await infra.storage.set(config.KEYS.VISIBLE_TARGETS, newVisibleTargets);
-            state.visibleTargets = newVisibleTargets;
-            const oldTargets = config.DISPLAY_ORDER;
-            oldTargets.forEach((id) => {
-                if (!newVisibleTargets.includes(id) && state.selectedTargets.has(id)) state.selectedTargets.delete(id);
-            });
-            ui.rebuildChipsUI();
+            await settingsSync.applyVisibleTargets(newVisibleTargets, { persist: true });
         };
 
         const onAnimationToggleChange = async (event) => {
-            const { state, config, elements, utils } = AITabSync;
+            const { state, settingsSync, utils } = AITabSync;
             const isSpinEnabled = event.target.checked;
             const newStyle = isSpinEnabled ? 'spin' : 'aurora';
             if (state.animationStyle === newStyle) return;
-            await infra.storage.set(config.KEYS.ANIMATION_STYLE, newStyle);
-            state.animationStyle = newStyle;
+            await settingsSync.applyAnimationStyle(newStyle, { persist: true });
             utils.log(`动画样式已切换为: ${newStyle}`);
-            elements.fab.classList.remove('animation-aurora', 'animation-spin', 'intro-playing');
-            elements.fab.classList.add(isSpinEnabled ? 'animation-spin' : 'animation-aurora');
-            if (isSpinEnabled) elements.fab.classList.add('intro-playing');
         };
 
         const onSelectionSyncToggleChange = async (event) => {
-            const { state, config, utils } = AITabSync;
+            const { settingsSync, utils } = AITabSync;
             const isEnabled = event.target.checked;
-            state.isSelectionSynced = isEnabled;
-            await infra.storage.set(config.KEYS.SELECTION_SYNC_ENABLED, isEnabled);
+            await settingsSync.applySelectionSyncEnabled(isEnabled, {
+                persist: true,
+                clearSharedSelectionOnDisable: true,
+            });
             utils.log(`选择状态同步已 ${isEnabled ? '开启' : '关闭'}.`);
-            if (!isEnabled) {
-                infra.storage.del(config.KEYS.SHARED_SELECTION);
-            }
         };
 
         const onSiteInjectionStrategyChange = async (event) => {
-            const { state, config, utils } = AITabSync;
+            const { settingsSync, utils } = AITabSync;
             const target = event.target;
             const siteId = target?.dataset?.siteId;
             const strategy = target?.value;
             if (!siteId || (strategy !== 'drop' && strategy !== 'paste')) return;
 
-            const nextStrategies = {
-                ...state.assetSiteInjectionStrategies,
+            await settingsSync.applyAssetSiteInjectionStrategies({
                 [siteId]: strategy,
-            };
-            state.assetSiteInjectionStrategies = nextStrategies;
-            await infra.storage.set(config.KEYS.ASSET_SITE_INJECTION_STRATEGIES, nextStrategies);
+            }, {
+                persist: true,
+                mergeStrategies: true,
+            });
             utils.log('站点资产注入策略已更新', { siteId, strategy });
         };
 
         const onApplyRecommendedSiteStrategies = async () => {
-            const { state, config, utils, elements } = AITabSync;
-            const nextStrategies = utils.getRecommendedAssetSiteStrategies();
-
-            state.assetSiteInjectionStrategies = nextStrategies;
-            await infra.storage.set(config.KEYS.ASSET_SITE_INJECTION_STRATEGIES, nextStrategies);
-
-            elements.settingsModal?.querySelectorAll('.ai-sync-site-injection-select').forEach((selectEl) => {
-                const siteId = selectEl?.dataset?.siteId;
-                if (!siteId) return;
-                selectEl.value = nextStrategies[siteId] || 'paste';
+            const { settingsSync, utils } = AITabSync;
+            const nextStrategies = await settingsSync.applyRecommendedAssetSiteInjectionStrategies({
+                persist: true,
             });
-
             utils.log('已应用推荐站点资产注入策略', nextStrategies);
         };
 
@@ -2278,27 +2545,21 @@
         };
 
         const onToggleLogging = async () => {
-            const { state, ui } = AITabSync;
-            state.isLoggingEnabled = !state.isLoggingEnabled;
-            await infra.storage.set(AITabSync.config.KEYS.LOGGING_ENABLED, state.isLoggingEnabled);
-            alert(`[AI Sync] 调试日志 ${state.isLoggingEnabled ? '已开启' : '已关闭'}。`);
-            ui.updateMenuCommand();
+            const { state, settingsSync } = AITabSync;
+            const nextEnabled = await settingsSync.applyLoggingEnabled(!state.isLoggingEnabled, { persist: true });
+            alert(`[AI Sync] 调试日志 ${nextEnabled ? '已开启' : '已关闭'}。`);
         };
 
         const onToggleAssetTrace = async () => {
-            const { state, ui } = AITabSync;
-            state.isAssetTraceEnabled = !state.isAssetTraceEnabled;
-            await infra.storage.set(AITabSync.config.KEYS.ASSET_TRACE_ENABLED, state.isAssetTraceEnabled);
-            alert(`[AI Sync] 资产链路日志 ${state.isAssetTraceEnabled ? '已开启' : '已关闭'}。`);
-            ui.updateMenuCommand();
+            const { state, settingsSync } = AITabSync;
+            const nextEnabled = await settingsSync.applyAssetTraceEnabled(!state.isAssetTraceEnabled, { persist: true });
+            alert(`[AI Sync] 资产链路日志 ${nextEnabled ? '已开启' : '已关闭'}。`);
         };
 
         const onToggleStrictMode = async () => {
-            const { state, ui, config } = AITabSync;
-            state.isStrictModeEnabled = !state.isStrictModeEnabled;
-            await infra.storage.set(config.KEYS.STRICT_MODE_ENABLED, state.isStrictModeEnabled);
-            alert(`[AI Sync] 严格模式 ${state.isStrictModeEnabled ? '已开启' : '已关闭'}。`);
-            ui.updateMenuCommand();
+            const { state, settingsSync } = AITabSync;
+            const nextEnabled = await settingsSync.applyStrictModeEnabled(!state.isStrictModeEnabled, { persist: true });
+            alert(`[AI Sync] 严格模式 ${nextEnabled ? '已开启' : '已关闭'}。`);
         };
 
         return {
