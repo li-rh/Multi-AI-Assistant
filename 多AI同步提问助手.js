@@ -1,10 +1,10 @@
 // ==UserScript==
-// @name         多AI同步提问助手
-// @name:zh-CN   多AI同步提问助手
-// @name:en      AI Chat Assistant (One-click Sync Multi-Model)
+// @name         多模型AI聊天助手
+// @name:zh-CN   多模型AI聊天助手
+// @name:en       Multi-AI Chat Assistant (One-click Sync Multi-AI)
 // @version      3.3-dev
-// @description  在任意已支持的 AI 聊天页面提问后，自动将同一问题同步到其他已打开且选中的 AI 标签页，实现多模型并行提问与效果对比。（基于“多AI同步提问助手.js”&“多模型同时回答 & 目录导航.js”）
-// @description:en  After you send a prompt on any supported AI chat site, the script automatically syncs it to other open and selected AI tabs for parallel multi-model comparison.
+// @description  避免 AI 页面反复复制粘贴、来回切页、逐个发送，一键同步文本、图片和文件到多个 AI 标签页，减少重复操作并加速多模型对比流程（完全免费）。
+// @description:en  Avoid repetitive copy-paste, tab switching, and one-by-one sending across AI pages. One click syncs text, images, and files to multiple AI tabs, reducing repetitive work and accelerating multi-model comparison (Completely Free).
 // @author       GPT-5.3-Codex & Ryanli
 // @icon         data:image/svg+xml;base64,PHN2ZyB4bWxucz0iaHR0cDovL3d3dy53My5vcmcvMjAwMC9zdmciIHdpZHRoPSI2NCIgaGVpZ2h0PSI2NCIgdmlld0JveD0iMCAwIDY0IDY0IiBmaWxsPSJub25lIj4KICA8Y2lyY2xlIGN4PSIzMiIgY3k9IjMyIiByPSIyMiIgc3Ryb2tlPSIjNTlCOUU2IiBzdHJva2Utd2lkdGg9IjMiIHN0cm9rZS1kYXNoYXJyYXk9IjEyIDgiLz4KICA8Y2lyY2xlIGN4PSIzMiIgY3k9IjMyIiByPSIxNiIgc3Ryb2tlPSIjRjRDNTQyIiBzdHJva2Utd2lkdGg9IjMiIHN0cm9rZS1kYXNoYXJyYXk9IjEwIDgiLz4KICA8cGF0aCBkPSJNMzAgMjhhNCA0IDAgMSAxIDUgMy44VjM1IiBzdHJva2U9IiMxMTEiIHN0cm9rZS13aWR0aD0iMyIgc3Ryb2tlLWxpbmVjYXA9InJvdW5kIiBzdHJva2UtbGluZWpvaW49InJvdW5kIi8+CiAgPGNpcmNsZSBjeD0iMzQiIGN5PSIzOSIgcj0iMiIgZmlsbD0iIzExMSIvPgogIDxwYXRoIGQ9Ik04IDEwaDEyYTMgMyAwIDAgMSAzIDN2NWEzIDMgMCAwIDEtMyAzaC00bC0zIDN2LTNoLTVhMyAzIDAgMCAxLTMtM3YtNWEzIDMgMCAwIDEgMy0zeiIgZmlsbD0iI0Y0QzU0MiIgc3Ryb2tlPSIjMTExIiBzdHJva2Utd2lkdGg9IjIiLz4KICA8cGF0aCBkPSJNNDkgMjdoOWEzIDMgMCAwIDEgMyAzdjVhMyAzIDAgMCAxLTMgM2gtNWwtMyAzdi0zaC0xYTMgMyAwIDAgMS0zLTN2LTVhMyAzIDAgMCAxIDMtM3oiIGZpbGw9IiM1OUI5RTYiIHN0cm9rZT0iIzExMSIgc3Ryb2tlLXdpZHRoPSIyIi8+Cjwvc3ZnPg==
 // @match        https://doubao.com/chat/*
